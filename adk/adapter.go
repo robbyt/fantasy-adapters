@@ -165,7 +165,7 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 			}
 		}
 
-		if req.Config.Tools != nil && len(req.Config.Tools) > 0 {
+		if len(req.Config.Tools) > 0 {
 			tools, err := genaiToolsToFantasyTools(req.Config.Tools)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("tools: %w", err))

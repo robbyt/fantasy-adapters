@@ -149,7 +149,7 @@ func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
 	}
 
 	require.Len(t, responses, 1)
-	assert.NoError(t, errs[0])
+	require.NoError(t, errs[0])
 
 	resp := responses[0]
 	require.NotNil(t, resp.Content)
@@ -184,7 +184,7 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 
 	var responses []*model.LLMResponse
 	for resp, err := range iter {
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		responses = append(responses, resp)
 	}
 
