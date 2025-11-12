@@ -616,71 +616,173 @@ func TestLlmRequestToFantasyCall_SystemInstruction(t *testing.T) {
 	assert.Equal(t, fantasy.MessageRoleSystem, call.Prompt[0].Role)
 }
 
-func TestLlmRequestToFantasyCall_ToolChoice(t *testing.T) {
+func TestLlmRequestToFantasyCall_ToolConfigAndFiltering(t *testing.T) {
 	tests := []struct {
-		name       string
-		config     *genai.FunctionCallingConfig
-		wantChoice *fantasy.ToolChoice
-		wantErr    bool
+		name           string
+		toolNames      []string // Tools to define
+		config         *genai.FunctionCallingConfig
+		wantChoice     *fantasy.ToolChoice
+		wantToolCount  int    // Expected number of tools after filtering
+		wantErr        bool   // Whether error is expected
+		wantErrContain string // Substring to check in error message
 	}{
+		// Basic mode tests
 		{
-			name: "AUTO mode",
-			config: &genai.FunctionCallingConfig{
-				Mode: "AUTO",
-			},
-			wantChoice: ptrToolChoice(fantasy.ToolChoiceAuto),
+			name:          "AUTO mode",
+			config:        &genai.FunctionCallingConfig{Mode: "AUTO"},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceAuto),
+			wantToolCount: 0,
 		},
 		{
-			name: "ANY mode",
-			config: &genai.FunctionCallingConfig{
-				Mode: "ANY",
-			},
-			wantChoice: ptrToolChoice(fantasy.ToolChoiceRequired),
+			name:          "ANY mode",
+			config:        &genai.FunctionCallingConfig{Mode: "ANY"},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceRequired),
+			wantToolCount: 0,
 		},
 		{
-			name: "NONE mode",
-			config: &genai.FunctionCallingConfig{
-				Mode: "NONE",
-			},
-			wantChoice: ptrToolChoice(fantasy.ToolChoiceNone),
+			name:          "NONE mode",
+			config:        &genai.FunctionCallingConfig{Mode: "NONE"},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceNone),
+			wantToolCount: 0,
 		},
 		{
-			name: "single allowed function",
-			config: &genai.FunctionCallingConfig{
-				AllowedFunctionNames: []string{"test-func"},
-			},
-			wantChoice: ptrToolChoice(fantasy.ToolChoice("test-func")),
+			name:           "VALIDATED mode",
+			config:         &genai.FunctionCallingConfig{Mode: "VALIDATED"},
+			wantErr:        true,
+			wantErrContain: "validated tool mode not supported",
 		},
 		{
-			name: "multiple allowed functions",
-			config: &genai.FunctionCallingConfig{
-				AllowedFunctionNames: []string{"func1", "func2"},
-			},
-			wantErr: true,
+			name:           "Unknown mode",
+			config:         &genai.FunctionCallingConfig{Mode: "UNKNOWN_MODE"},
+			wantErr:        true,
+			wantErrContain: "unsupported tool calling mode",
+		},
+
+		// Single allowed function tests
+		{
+			name:          "single allowed function no mode",
+			toolNames:     []string{"test-func"},
+			config:        &genai.FunctionCallingConfig{AllowedFunctionNames: []string{"test-func"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoice("test-func")),
+			wantToolCount: 1,
+		},
+		{
+			name:          "AUTO mode with single allowed function",
+			toolNames:     []string{"test-func"},
+			config:        &genai.FunctionCallingConfig{Mode: "AUTO", AllowedFunctionNames: []string{"test-func"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoice("test-func")),
+			wantToolCount: 1,
+		},
+		{
+			name:          "ANY mode with single allowed function",
+			toolNames:     []string{"func1", "func2"},
+			config:        &genai.FunctionCallingConfig{Mode: "ANY", AllowedFunctionNames: []string{"func2"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoice("func2")),
+			wantToolCount: 1,
+		},
+		{
+			name:          "NONE mode with single allowed function",
+			toolNames:     []string{"test-func"},
+			config:        &genai.FunctionCallingConfig{Mode: "NONE", AllowedFunctionNames: []string{"test-func"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceNone),
+			wantToolCount: 1,
+		},
+
+		// Multiple allowed functions tests
+		{
+			name:          "AUTO mode with multiple allowed functions",
+			toolNames:     []string{"func1", "func2"},
+			config:        &genai.FunctionCallingConfig{Mode: "AUTO", AllowedFunctionNames: []string{"func1", "func2"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceAuto),
+			wantToolCount: 2,
+		},
+		{
+			name:          "ANY mode with multiple allowed functions",
+			toolNames:     []string{"func1", "func2"},
+			config:        &genai.FunctionCallingConfig{Mode: "ANY", AllowedFunctionNames: []string{"func1", "func2"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceRequired),
+			wantToolCount: 2,
+		},
+
+		// Filtering tests
+		{
+			name:          "filters tools to allowed subset",
+			toolNames:     []string{"func1", "func2", "func3", "func4"},
+			config:        &genai.FunctionCallingConfig{Mode: "AUTO", AllowedFunctionNames: []string{"func2", "func4"}},
+			wantChoice:    ptrToolChoice(fantasy.ToolChoiceAuto),
+			wantToolCount: 2,
+		},
+		{
+			name:           "non-existent allowed function",
+			toolNames:      []string{"func1", "func2"},
+			config:         &genai.FunctionCallingConfig{Mode: "AUTO", AllowedFunctionNames: []string{"func1", "func_nonexistent"}},
+			wantErr:        true,
+			wantErrContain: "func_nonexistent",
+		},
+		{
+			name:           "all allowed functions non-existent",
+			toolNames:      []string{"func1", "func2"},
+			config:         &genai.FunctionCallingConfig{Mode: "AUTO", AllowedFunctionNames: []string{"func_bad1", "func_bad2"}},
+			wantErr:        true,
+			wantErrContain: "not found in tools list",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := &model.LLMRequest{
-				Config: &genai.GenerateContentConfig{
-					ToolConfig: &genai.ToolConfig{
-						FunctionCallingConfig: tt.config,
-					},
+			config := &genai.GenerateContentConfig{
+				ToolConfig: &genai.ToolConfig{
+					FunctionCallingConfig: tt.config,
 				},
 			}
+
+			// Add tools if specified
+			if len(tt.toolNames) > 0 {
+				tools := make([]*genai.FunctionDeclaration, len(tt.toolNames))
+				for i, name := range tt.toolNames {
+					tools[i] = &genai.FunctionDeclaration{
+						Name:        name,
+						Description: "Test function " + name,
+					}
+				}
+				config.Tools = []*genai.Tool{
+					{FunctionDeclarations: tools},
+				}
+			}
+
+			req := &model.LLMRequest{Config: config}
 
 			call, err := llmRequestToFantasyCall(req)
 			if tt.wantErr {
 				require.Error(t, err)
+				if tt.wantErrContain != "" {
+					assert.Contains(t, err.Error(), tt.wantErrContain)
+				}
 				return
 			}
 
 			require.NoError(t, err)
 
+			// Check ToolChoice
 			if tt.wantChoice != nil {
 				require.NotNil(t, call.ToolChoice)
 				assert.Equal(t, *tt.wantChoice, *call.ToolChoice)
+			}
+
+			// Check tool count after filtering
+			assert.Len(t, call.Tools, tt.wantToolCount)
+
+			// Verify filtered tools contain only allowed functions
+			if len(tt.config.AllowedFunctionNames) > 0 && !tt.wantErr {
+				allowedMap := make(map[string]bool)
+				for _, name := range tt.config.AllowedFunctionNames {
+					allowedMap[name] = true
+				}
+				for _, tool := range call.Tools {
+					if ft, ok := tool.(fantasy.FunctionTool); ok {
+						assert.True(t, allowedMap[ft.Name], "tool %q should be in allowed list", ft.Name)
+					}
+				}
 			}
 		})
 	}

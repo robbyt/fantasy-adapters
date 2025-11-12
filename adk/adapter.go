@@ -115,14 +115,23 @@ func (a *Adapter) GenerateContent(ctx context.Context, req *model.LLMRequest, st
 //   - Config.PresencePenalty/FrequencyPenalty -> Call parameters
 //   - Config.SystemInstruction -> System message in Prompt
 //   - Contents -> Prompt messages
-//   - Config.Tools -> Call.Tools
-//   - Config.ToolConfig.FunctionCallingConfig -> Call.ToolChoice
+//   - Config.Tools -> Call.Tools (filtered by AllowedFunctionNames if specified)
+//   - Config.ToolConfig.FunctionCallingConfig.Mode -> Call.ToolChoice
+//   - Config.ToolConfig.FunctionCallingConfig.AllowedFunctionNames -> filters Call.Tools
+//
+// AllowedFunctionNames handling:
+//   - Validates all allowed names exist in the tools list (returns error if not)
+//   - Filters Call.Tools to only include allowed functions
+//   - Single allowed function + Mode=AUTO/ANY -> forces that specific tool
+//   - Multiple allowed functions + Mode=AUTO -> ToolChoiceAuto
+//   - Multiple allowed functions + Mode=ANY -> ToolChoiceRequired
 //
 // Returns errors for unsupported ADK features:
 //   - SafetySettings, ResponseMIMEType, ResponseSchema
 //   - ThinkingConfig (use provider-specific options instead)
 //   - CachedContent, FileData URIs
 //   - Retrieval/code execution tools
+//   - AllowedFunctionNames containing non-existent function names
 func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 	var call fantasy.Call
 	var errs []error
@@ -189,6 +198,39 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 
 		if req.Config.ToolConfig != nil && req.Config.ToolConfig.FunctionCallingConfig != nil {
 			fc := req.Config.ToolConfig.FunctionCallingConfig
+
+			// Filter tools by AllowedFunctionNames if specified
+			if len(fc.AllowedFunctionNames) > 0 {
+				// Validate that all allowed names exist in the tools list
+				toolNames := make(map[string]bool)
+				for _, tool := range call.Tools {
+					if ft, ok := tool.(fantasy.FunctionTool); ok {
+						toolNames[ft.Name] = true
+					}
+				}
+
+				for _, allowedName := range fc.AllowedFunctionNames {
+					if !toolNames[allowedName] {
+						errs = append(errs, fmt.Errorf("allowed function %q not found in tools list", allowedName))
+					}
+				}
+
+				// Filter tools to only include allowed ones
+				filteredTools := make([]fantasy.Tool, 0, len(fc.AllowedFunctionNames))
+				for _, tool := range call.Tools {
+					if ft, ok := tool.(fantasy.FunctionTool); ok {
+						for _, allowedName := range fc.AllowedFunctionNames {
+							if ft.Name == allowedName {
+								filteredTools = append(filteredTools, tool)
+								break
+							}
+						}
+					}
+				}
+				call.Tools = filteredTools
+			}
+
+			// Set ToolChoice based on Mode
 			switch fc.Mode {
 			case ToolModeAuto:
 				tc := fantasy.ToolChoiceAuto
@@ -201,13 +243,18 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 				call.ToolChoice = &tc
 			case ToolModeValidated:
 				errs = append(errs, errors.New("validated tool mode not supported"))
+			case "":
+				// No mode specified, allow specific function if only one
+			default:
+				if fc.Mode != "" {
+					errs = append(errs, fmt.Errorf("unsupported tool calling mode: %q", fc.Mode))
+				}
 			}
 
-			if len(fc.AllowedFunctionNames) == 1 {
+			// Override with specific function if exactly one is allowed
+			if len(fc.AllowedFunctionNames) == 1 && fc.Mode != ToolModeNone {
 				tc := fantasy.ToolChoice(fc.AllowedFunctionNames[0])
 				call.ToolChoice = &tc
-			} else if len(fc.AllowedFunctionNames) > 1 {
-				errs = append(errs, errors.New("multiple allowed function names not supported"))
 			}
 		}
 	}

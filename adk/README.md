@@ -101,7 +101,6 @@ The following ADK features are not supported and will return errors:
 - Retrieval tools (Google Search, Vertex AI Search)
 - Code execution
 - Video metadata
-- Multiple allowed function names (only single tool selection supported)
 
 For provider-specific features (like Anthropic's extended thinking), use the Fantasy provider options directly instead of ADK's configuration.
 
