@@ -3,9 +3,19 @@ package adk
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/anthropic"
+	"charm.land/fantasy/providers/azure"
+	"charm.land/fantasy/providers/bedrock"
+	"charm.land/fantasy/providers/google"
+	"charm.land/fantasy/providers/openai"
+	"charm.land/fantasy/providers/openaicompat"
+	"charm.land/fantasy/providers/openrouter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
@@ -79,18 +89,22 @@ func TestNewAdapter(t *testing.T) {
 	}
 
 	adapter := NewAdapter(mock)
-	if adapter == nil {
-		t.Fatal("NewAdapter returned nil")
+	require.NotNil(t, adapter)
+	require.IsType(t, &Adapter{}, adapter)
+
+	adapterImpl := adapter.(*Adapter)
+	assert.Equal(t, mock, adapterImpl.model)
+}
+
+func TestAdapter_Implements_ModelLLM_Interface(t *testing.T) {
+	mock := &mockLanguageModel{
+		provider: "test-provider",
+		modelID:  "test-model",
 	}
 
-	adapterImpl, ok := adapter.(*Adapter)
-	if !ok {
-		t.Fatal("NewAdapter did not return *Adapter")
-	}
+	adapter := NewAdapter(mock)
 
-	if adapterImpl.model != mock {
-		t.Error("Adapter model not set correctly")
-	}
+	assert.Implements(t, (*model.LLM)(nil), adapter)
 }
 
 func TestAdapter_Name(t *testing.T) {
@@ -102,10 +116,7 @@ func TestAdapter_Name(t *testing.T) {
 	adapter := &Adapter{model: mock}
 	name := adapter.Name()
 
-	expected := "test-provider/test-model"
-	if name != expected {
-		t.Errorf("Name() = %q, want %q", name, expected)
-	}
+	assert.Equal(t, "test-provider/test-model", name)
 }
 
 func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
@@ -127,7 +138,7 @@ func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, false)
 
 	var responses []*model.LLMResponse
@@ -137,34 +148,16 @@ func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
 		errs = append(errs, err)
 	}
 
-	if len(responses) != 1 {
-		t.Fatalf("expected 1 response, got %d", len(responses))
-	}
-
-	if errs[0] != nil {
-		t.Errorf("unexpected error: %v", errs[0])
-	}
+	require.Len(t, responses, 1)
+	assert.NoError(t, errs[0])
 
 	resp := responses[0]
-	if resp.Content == nil {
-		t.Fatal("response Content is nil")
-	}
+	require.NotNil(t, resp.Content)
+	require.Len(t, resp.Content.Parts, 1)
 
-	if len(resp.Content.Parts) != 1 {
-		t.Fatalf("expected 1 part, got %d", len(resp.Content.Parts))
-	}
-
-	if resp.Content.Parts[0].Text != "test response" {
-		t.Errorf("unexpected text: %q", resp.Content.Parts[0].Text)
-	}
-
-	if !resp.TurnComplete {
-		t.Error("TurnComplete should be true")
-	}
-
-	if resp.Partial {
-		t.Error("Partial should be false")
-	}
+	assert.Equal(t, "test response", resp.Content.Parts[0].Text)
+	assert.True(t, resp.TurnComplete)
+	assert.False(t, resp.Partial)
 }
 
 func TestAdapter_GenerateContent_Streaming(t *testing.T) {
@@ -186,25 +179,19 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, true)
 
 	var responses []*model.LLMResponse
 	for resp, err := range iter {
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
+		assert.NoError(t, err)
 		responses = append(responses, resp)
 	}
 
-	if len(responses) < 1 {
-		t.Fatal("expected at least 1 response")
-	}
+	require.NotEmpty(t, responses)
 
 	finalResp := responses[len(responses)-1]
-	if !finalResp.TurnComplete {
-		t.Error("final response TurnComplete should be true")
-	}
+	assert.True(t, finalResp.TurnComplete)
 }
 
 func TestLlmRequestToFantasyCall_Basic(t *testing.T) {
@@ -231,36 +218,21 @@ func TestLlmRequestToFantasyCall_Basic(t *testing.T) {
 	}
 
 	call, err := llmRequestToFantasyCall(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
-	if call.Temperature == nil {
-		t.Fatal("Temperature is nil")
-	}
-	const epsilon = 0.0001
-	if *call.Temperature < 0.7-epsilon || *call.Temperature > 0.7+epsilon {
-		t.Errorf("Temperature = %f, want ~0.7", *call.Temperature)
-	}
+	require.NotNil(t, call.Temperature)
+	assert.InDelta(t, 0.7, *call.Temperature, 0.0001)
 
-	if call.TopP == nil {
-		t.Fatal("TopP is nil")
-	}
-	if *call.TopP < 0.9-epsilon || *call.TopP > 0.9+epsilon {
-		t.Errorf("TopP = %f, want ~0.9", *call.TopP)
-	}
+	require.NotNil(t, call.TopP)
+	assert.InDelta(t, 0.9, *call.TopP, 0.0001)
 
-	if call.TopK == nil || *call.TopK != 40 {
-		t.Error("TopK not set correctly")
-	}
+	require.NotNil(t, call.TopK)
+	assert.Equal(t, int64(40), *call.TopK)
 
-	if call.MaxOutputTokens == nil || *call.MaxOutputTokens != 100 {
-		t.Error("MaxOutputTokens not set correctly")
-	}
+	require.NotNil(t, call.MaxOutputTokens)
+	assert.Equal(t, int64(100), *call.MaxOutputTokens)
 
-	if len(call.Prompt) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(call.Prompt))
-	}
+	require.Len(t, call.Prompt, 1)
 }
 
 func TestLlmRequestToFantasyCall_UnsupportedFeatures(t *testing.T) {
@@ -306,13 +278,8 @@ func TestLlmRequestToFantasyCall_UnsupportedFeatures(t *testing.T) {
 			}
 
 			_, err := llmRequestToFantasyCall(req)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-
-			if !errors.Is(err, errors.New(tt.errMsg)) && err.Error() != tt.errMsg {
-				t.Errorf("expected error containing %q, got %v", tt.errMsg, err)
-			}
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.errMsg)
 		})
 	}
 }
@@ -372,23 +339,13 @@ func TestGenaiContentToFantasyMessage(t *testing.T) {
 			msg, err := genaiContentToFantasyMessage(tt.content, tt.role)
 
 			if tt.expectErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if len(msg.Content) != tt.expectParts {
-				t.Errorf("expected %d parts, got %d", tt.expectParts, len(msg.Content))
-			}
-
-			if msg.Role != tt.role {
-				t.Errorf("expected role %v, got %v", tt.role, msg.Role)
-			}
+			require.NoError(t, err)
+			assert.Len(t, msg.Content, tt.expectParts)
+			assert.Equal(t, tt.role, msg.Role)
 		})
 	}
 }
@@ -414,45 +371,22 @@ func TestFantasyResponseToLLM(t *testing.T) {
 
 	llmResp := fantasyResponseToLLM(resp)
 
-	if llmResp.Content == nil {
-		t.Fatal("Content is nil")
-	}
+	require.NotNil(t, llmResp.Content)
+	require.Len(t, llmResp.Content.Parts, 3)
 
-	if len(llmResp.Content.Parts) != 3 {
-		t.Fatalf("expected 3 parts, got %d", len(llmResp.Content.Parts))
-	}
+	assert.Equal(t, "hello", llmResp.Content.Parts[0].Text)
 
-	if llmResp.Content.Parts[0].Text != "hello" {
-		t.Error("text part not converted correctly")
-	}
+	require.NotNil(t, llmResp.Content.Parts[1].FunctionCall)
 
-	if llmResp.Content.Parts[1].FunctionCall == nil {
-		t.Fatal("function call part is nil")
-	}
+	assert.Equal(t, "thinking", llmResp.Content.Parts[2].Text)
+	assert.True(t, llmResp.Content.Parts[2].Thought)
 
-	if llmResp.Content.Parts[2].Text != "thinking" || !llmResp.Content.Parts[2].Thought {
-		t.Error("reasoning part not converted correctly")
-	}
+	require.NotNil(t, llmResp.UsageMetadata)
+	assert.Equal(t, int32(10), llmResp.UsageMetadata.PromptTokenCount)
 
-	if llmResp.UsageMetadata == nil {
-		t.Fatal("UsageMetadata is nil")
-	}
-
-	if llmResp.UsageMetadata.PromptTokenCount != 10 {
-		t.Errorf("PromptTokenCount = %d, want 10", llmResp.UsageMetadata.PromptTokenCount)
-	}
-
-	if !llmResp.TurnComplete {
-		t.Error("TurnComplete should be true")
-	}
-
-	if llmResp.Partial {
-		t.Error("Partial should be false")
-	}
-
-	if llmResp.FinishReason != genai.FinishReasonStop {
-		t.Errorf("FinishReason = %v, want %v", llmResp.FinishReason, genai.FinishReasonStop)
-	}
+	assert.True(t, llmResp.TurnComplete)
+	assert.False(t, llmResp.Partial)
+	assert.Equal(t, genai.FinishReasonStop, llmResp.FinishReason)
 }
 
 func TestFantasyStreamToLLM(t *testing.T) {
@@ -490,24 +424,15 @@ func TestFantasyStreamToLLM(t *testing.T) {
 
 	var responses []*model.LLMResponse
 	for resp, err := range iter {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err)
 		responses = append(responses, resp)
 	}
 
-	if len(responses) < 1 {
-		t.Fatal("expected at least 1 response")
-	}
+	require.NotEmpty(t, responses)
 
 	finalResp := responses[len(responses)-1]
-	if !finalResp.TurnComplete {
-		t.Error("final response should have TurnComplete=true")
-	}
-
-	if finalResp.UsageMetadata == nil {
-		t.Fatal("final response UsageMetadata is nil")
-	}
+	assert.True(t, finalResp.TurnComplete)
+	require.NotNil(t, finalResp.UsageMetadata)
 }
 
 func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
@@ -535,9 +460,7 @@ func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
 	iter := fantasyStreamToLLM(stream)
 
 	for resp, err := range iter {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err)
 		if resp.TurnComplete {
 			break
 		}
@@ -559,18 +482,12 @@ func TestFantasyStreamToLLM_WithError(t *testing.T) {
 	for resp, err := range iter {
 		gotError = err
 		if resp != nil && resp.ErrorCode != "" {
-			if resp.ErrorCode != "ERROR" {
-				t.Errorf("ErrorCode = %q, want ERROR", resp.ErrorCode)
-			}
-			if resp.ErrorMessage != testErr.Error() {
-				t.Errorf("ErrorMessage = %q, want %q", resp.ErrorMessage, testErr.Error())
-			}
+			assert.Equal(t, "ERROR", resp.ErrorCode)
+			assert.Equal(t, testErr.Error(), resp.ErrorMessage)
 		}
 	}
 
-	if gotError == nil {
-		t.Error("expected error, got nil")
-	}
+	require.Error(t, gotError)
 }
 
 func TestFantasyFinishReasonToGenai(t *testing.T) {
@@ -590,9 +507,7 @@ func TestFantasyFinishReasonToGenai(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(string(tt.fantasy), func(t *testing.T) {
 			result := fantasyFinishReasonToGenai(tt.fantasy)
-			if result != tt.genai {
-				t.Errorf("fantasyFinishReasonToGenai(%q) = %v, want %v", tt.fantasy, result, tt.genai)
-			}
+			assert.Equal(t, tt.genai, result)
 		})
 	}
 }
@@ -610,22 +525,12 @@ func TestGenaiToolsToFantasyTools(t *testing.T) {
 	}
 
 	fantasyTools, err := genaiToolsToFantasyTools(tools)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(fantasyTools) != 1 {
-		t.Fatalf("expected 1 tool, got %d", len(fantasyTools))
-	}
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
 
 	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
-	if !ok {
-		t.Fatal("tool is not FunctionTool")
-	}
-
-	if ft.Name != "test-function" {
-		t.Errorf("Name = %q, want test-function", ft.Name)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "test-function", ft.Name)
 }
 
 func TestGenaiToolsToFantasyTools_UnsupportedTools(t *testing.T) {
@@ -639,9 +544,7 @@ func TestGenaiToolsToFantasyTools_UnsupportedTools(t *testing.T) {
 	}
 
 	_, err := genaiToolsToFantasyTools(tools)
-	if err == nil {
-		t.Fatal("expected error for unsupported tool, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestLlmRequestToFantasyCall_SystemInstruction(t *testing.T) {
@@ -664,17 +567,9 @@ func TestLlmRequestToFantasyCall_SystemInstruction(t *testing.T) {
 	}
 
 	call, err := llmRequestToFantasyCall(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(call.Prompt) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(call.Prompt))
-	}
-
-	if call.Prompt[0].Role != fantasy.MessageRoleSystem {
-		t.Error("first message should be system")
-	}
+	require.NoError(t, err)
+	require.Len(t, call.Prompt, 2)
+	assert.Equal(t, fantasy.MessageRoleSystem, call.Prompt[0].Role)
 }
 
 func TestLlmRequestToFantasyCall_ToolChoice(t *testing.T) {
@@ -733,23 +628,15 @@ func TestLlmRequestToFantasyCall_ToolChoice(t *testing.T) {
 
 			call, err := llmRequestToFantasyCall(req)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
+				require.Error(t, err)
 				return
 			}
 
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			require.NoError(t, err)
 
 			if tt.wantChoice != nil {
-				if call.ToolChoice == nil {
-					t.Fatal("ToolChoice is nil")
-				}
-				if *call.ToolChoice != *tt.wantChoice {
-					t.Errorf("ToolChoice = %v, want %v", *call.ToolChoice, *tt.wantChoice)
-				}
+				require.NotNil(t, call.ToolChoice)
+				assert.Equal(t, *tt.wantChoice, *call.ToolChoice)
 			}
 		})
 	}
@@ -768,22 +655,12 @@ func TestGenaiContentToFantasyMessage_FunctionCall(t *testing.T) {
 	}
 
 	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleAssistant)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(msg.Content) != 1 {
-		t.Fatalf("expected 1 part, got %d", len(msg.Content))
-	}
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
 
 	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
-	if !ok {
-		t.Fatal("part is not ToolCallPart")
-	}
-
-	if toolCall.ToolCallID != "call-123" {
-		t.Errorf("ToolCallID = %q, want call-123", toolCall.ToolCallID)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "call-123", toolCall.ToolCallID)
 }
 
 func TestGenaiContentToFantasyMessage_FunctionResponse(t *testing.T) {
@@ -799,22 +676,12 @@ func TestGenaiContentToFantasyMessage_FunctionResponse(t *testing.T) {
 	}
 
 	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(msg.Content) != 1 {
-		t.Fatalf("expected 1 part, got %d", len(msg.Content))
-	}
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
 
 	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
-	if !ok {
-		t.Fatal("part is not ToolResultPart")
-	}
-
-	if toolResult.ToolCallID != "call-123" {
-		t.Errorf("ToolCallID = %q, want call-123", toolResult.ToolCallID)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "call-123", toolResult.ToolCallID)
 }
 
 func TestGenaiContentToFantasyMessage_ExecutableCode(t *testing.T) {
@@ -825,9 +692,7 @@ func TestGenaiContentToFantasyMessage_ExecutableCode(t *testing.T) {
 	}
 
 	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
-	if err == nil {
-		t.Fatal("expected error for executable code, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestGenaiContentToFantasyMessage_VideoMetadata(t *testing.T) {
@@ -838,9 +703,7 @@ func TestGenaiContentToFantasyMessage_VideoMetadata(t *testing.T) {
 	}
 
 	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
-	if err == nil {
-		t.Fatal("expected error for video metadata, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestAdapter_GenerateContent_RequestError(t *testing.T) {
@@ -856,7 +719,7 @@ func TestAdapter_GenerateContent_RequestError(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, false)
 
 	var gotErr error
@@ -864,9 +727,7 @@ func TestAdapter_GenerateContent_RequestError(t *testing.T) {
 		gotErr = err
 	}
 
-	if gotErr == nil {
-		t.Fatal("expected error, got nil")
-	}
+	require.Error(t, gotErr)
 }
 
 func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
@@ -892,7 +753,7 @@ func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, false)
 
 	var gotErr error
@@ -900,13 +761,8 @@ func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 		gotErr = err
 	}
 
-	if gotErr == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	if !errors.Is(gotErr, testErr) {
-		t.Errorf("expected error %v, got %v", testErr, gotErr)
-	}
+	require.Error(t, gotErr)
+	assert.ErrorIs(t, gotErr, testErr)
 }
 
 func TestAdapter_GenerateContent_StreamError(t *testing.T) {
@@ -932,7 +788,7 @@ func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, true)
 
 	var gotErr error
@@ -940,13 +796,8 @@ func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 		gotErr = err
 	}
 
-	if gotErr == nil {
-		t.Fatal("expected error, got nil")
-	}
-
-	if !errors.Is(gotErr, testErr) {
-		t.Errorf("expected error %v, got %v", testErr, gotErr)
-	}
+	require.Error(t, gotErr)
+	assert.ErrorIs(t, gotErr, testErr)
 }
 
 func TestFantasyStreamToLLM_ToolCalls(t *testing.T) {
@@ -976,22 +827,16 @@ func TestFantasyStreamToLLM_ToolCalls(t *testing.T) {
 
 	var responses []*model.LLMResponse
 	for resp, err := range iter {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err)
 		responses = append(responses, resp)
 	}
 
-	if len(responses) < 1 {
-		t.Fatal("expected at least 1 response")
-	}
+	require.NotEmpty(t, responses)
 }
 
 func TestFantasyFinishReasonToGenai_Default(t *testing.T) {
 	result := fantasyFinishReasonToGenai(fantasy.FinishReason("invalid"))
-	if result != genai.FinishReasonUnspecified {
-		t.Errorf("unexpected finish reason: %v", result)
-	}
+	assert.Equal(t, genai.FinishReasonUnspecified, result)
 }
 
 func ptrToolChoice(tc fantasy.ToolChoice) *fantasy.ToolChoice {
@@ -1010,24 +855,13 @@ func TestLlmRequestToFantasyCall_PresenceAndFrequencyPenalty(t *testing.T) {
 	}
 
 	call, err := llmRequestToFantasyCall(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
-	if call.PresencePenalty == nil {
-		t.Fatal("PresencePenalty is nil")
-	}
-	const epsilon = 0.0001
-	if *call.PresencePenalty < 0.5-epsilon || *call.PresencePenalty > 0.5+epsilon {
-		t.Errorf("PresencePenalty = %f, want ~0.5", *call.PresencePenalty)
-	}
+	require.NotNil(t, call.PresencePenalty)
+	assert.InDelta(t, 0.5, *call.PresencePenalty, 0.0001)
 
-	if call.FrequencyPenalty == nil {
-		t.Fatal("FrequencyPenalty is nil")
-	}
-	if *call.FrequencyPenalty < 0.3-epsilon || *call.FrequencyPenalty > 0.3+epsilon {
-		t.Errorf("FrequencyPenalty = %f, want ~0.3", *call.FrequencyPenalty)
-	}
+	require.NotNil(t, call.FrequencyPenalty)
+	assert.InDelta(t, 0.3, *call.FrequencyPenalty, 0.0001)
 }
 
 func TestLlmRequestToFantasyCall_Tools(t *testing.T) {
@@ -1047,13 +881,8 @@ func TestLlmRequestToFantasyCall_Tools(t *testing.T) {
 	}
 
 	call, err := llmRequestToFantasyCall(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(call.Tools) != 1 {
-		t.Fatalf("expected 1 tool, got %d", len(call.Tools))
-	}
+	require.NoError(t, err)
+	require.Len(t, call.Tools, 1)
 }
 
 func TestLlmRequestToFantasyCall_ToolChoiceValidated(t *testing.T) {
@@ -1068,9 +897,7 @@ func TestLlmRequestToFantasyCall_ToolChoiceValidated(t *testing.T) {
 	}
 
 	_, err := llmRequestToFantasyCall(req)
-	if err == nil {
-		t.Fatal("expected error for VALIDATED mode, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestLlmRequestToFantasyCall_RoleMapping(t *testing.T) {
@@ -1086,17 +913,9 @@ func TestLlmRequestToFantasyCall_RoleMapping(t *testing.T) {
 	}
 
 	call, err := llmRequestToFantasyCall(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(call.Prompt) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(call.Prompt))
-	}
-
-	if call.Prompt[0].Role != fantasy.MessageRoleAssistant {
-		t.Errorf("expected MessageRoleAssistant, got %v", call.Prompt[0].Role)
-	}
+	require.NoError(t, err)
+	require.Len(t, call.Prompt, 1)
+	assert.Equal(t, fantasy.MessageRoleAssistant, call.Prompt[0].Role)
 }
 
 func TestGenaiContentToFantasyMessage_CodeExecutionResult(t *testing.T) {
@@ -1107,9 +926,7 @@ func TestGenaiContentToFantasyMessage_CodeExecutionResult(t *testing.T) {
 	}
 
 	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
-	if err == nil {
-		t.Fatal("expected error for code execution result, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestFantasyStreamToLLM_ToolCall(t *testing.T) {
@@ -1129,9 +946,7 @@ func TestFantasyStreamToLLM_ToolCall(t *testing.T) {
 	iter := fantasyStreamToLLM(stream)
 
 	for _, err := range iter {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err)
 	}
 }
 
@@ -1149,7 +964,132 @@ func TestGenaiToolsToFantasyTools_WithParameters(t *testing.T) {
 	}
 
 	_, err := genaiToolsToFantasyTools(tools)
-	if err == nil {
-		t.Fatal("expected error for schema conversion, got nil")
+	require.Error(t, err)
+}
+
+func TestAnthropicProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Skip("ANTHROPIC_API_KEY not set")
 	}
+
+	ctx := t.Context()
+	provider, err := anthropic.New(anthropic.WithAPIKey(apiKey))
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "claude-3-5-sonnet-20241022")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestOpenAIProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		t.Skip("OPENAI_API_KEY not set")
+	}
+
+	ctx := t.Context()
+	provider, err := openai.New(openai.WithAPIKey(apiKey))
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "gpt-4o")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestGoogleProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("GOOGLE_API_KEY")
+	if apiKey == "" {
+		t.Skip("GOOGLE_API_KEY not set")
+	}
+
+	ctx := t.Context()
+	provider, err := google.New(google.WithGeminiAPIKey(apiKey))
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "gemini-2.0-flash-exp")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestAzureProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("AZURE_OPENAI_API_KEY")
+	baseURL := os.Getenv("AZURE_OPENAI_BASE_URL")
+	if apiKey == "" || baseURL == "" {
+		t.Skip("AZURE_OPENAI_API_KEY or AZURE_OPENAI_BASE_URL not set")
+	}
+
+	ctx := t.Context()
+	provider, err := azure.New(
+		azure.WithAPIKey(apiKey),
+		azure.WithBaseURL(baseURL),
+	)
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "gpt-4o")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestBedrockProvider_Implements_ModelLLM(t *testing.T) {
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		t.Skip("AWS_REGION not set")
+	}
+
+	ctx := t.Context()
+	provider, err := bedrock.New()
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "anthropic.claude-3-5-sonnet-20241022-v2:0")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestOpenRouterProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		t.Skip("OPENROUTER_API_KEY not set")
+	}
+
+	ctx := t.Context()
+	provider, err := openrouter.New(openrouter.WithAPIKey(apiKey))
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "anthropic/claude-3.5-sonnet")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestOpenAICompatProvider_Implements_ModelLLM(t *testing.T) {
+	apiKey := os.Getenv("OPENAI_COMPAT_API_KEY")
+	baseURL := os.Getenv("OPENAI_COMPAT_BASE_URL")
+	if apiKey == "" || baseURL == "" {
+		t.Skip("OPENAI_COMPAT_API_KEY or OPENAI_COMPAT_BASE_URL not set")
+	}
+
+	ctx := t.Context()
+	provider, err := openaicompat.New(
+		openaicompat.WithAPIKey(apiKey),
+		openaicompat.WithBaseURL(baseURL),
+	)
+	require.NoError(t, err)
+
+	languageModel, err := provider.LanguageModel(ctx, "model-name")
+	require.NoError(t, err)
+
+	adapter := NewAdapter(languageModel)
+	assert.Implements(t, (*model.LLM)(nil), adapter)
 }
