@@ -27,9 +27,11 @@ package adk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 
 	"charm.land/fantasy"
 	"google.golang.org/adk/model"
@@ -40,6 +42,12 @@ import (
 type Adapter struct {
 	model fantasy.LanguageModel
 }
+
+const (
+	ErrorCodeGeneric   = "ERROR"
+	ErrorCodeUnmarshal = "UNMARSHAL_ERROR"
+	RoleModel          = "model"
+)
 
 // NewAdapter creates a new ADK adapter for the given fantasy language model.
 func NewAdapter(m fantasy.LanguageModel) model.LLM {
@@ -201,7 +209,7 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 
 	for _, content := range req.Contents {
 		role := fantasy.MessageRoleUser
-		if content.Role == "model" {
+		if content.Role == RoleModel {
 			role = fantasy.MessageRoleAssistant
 		}
 
@@ -249,7 +257,12 @@ func genaiContentToFantasyMessage(content *genai.Content, role fantasy.MessageRo
 		} else if part.FunctionCall != nil {
 			input := ""
 			if part.FunctionCall.Args != nil {
-				errs = append(errs, errors.New("function call serialization not implemented"))
+				jsonBytes, err := json.Marshal(part.FunctionCall.Args)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("failed to marshal function call args: %w", err))
+				} else {
+					input = string(jsonBytes)
+				}
 			}
 			msg.Content = append(msg.Content, fantasy.ToolCallPart{
 				ToolCallID: part.FunctionCall.ID,
@@ -259,7 +272,12 @@ func genaiContentToFantasyMessage(content *genai.Content, role fantasy.MessageRo
 		} else if part.FunctionResponse != nil {
 			output := fantasy.ToolResultOutputContentText{Text: ""}
 			if part.FunctionResponse.Response != nil {
-				errs = append(errs, errors.New("function response serialization not implemented"))
+				jsonBytes, err := json.Marshal(part.FunctionResponse.Response)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("failed to marshal function response: %w", err))
+				} else {
+					output = fantasy.ToolResultOutputContentText{Text: string(jsonBytes)}
+				}
 			}
 			msg.Content = append(msg.Content, fantasy.ToolResultPart{
 				ToolCallID: part.FunctionResponse.ID,
@@ -275,6 +293,124 @@ func genaiContentToFantasyMessage(content *genai.Content, role fantasy.MessageRo
 	return msg, errors.Join(errs...)
 }
 
+func schemaToMap(schema *genai.Schema) (map[string]any, error) {
+	if schema == nil {
+		return nil, nil
+	}
+
+	result := make(map[string]any)
+
+	if schema.Type != "" {
+		result["type"] = fmt.Sprintf("%v", schema.Type)
+	}
+
+	if schema.Description != "" {
+		result["description"] = schema.Description
+	}
+
+	if schema.Title != "" {
+		result["title"] = schema.Title
+	}
+
+	if len(schema.Properties) > 0 {
+		props := make(map[string]any)
+		for key, val := range schema.Properties {
+			propMap, err := schemaToMap(val)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert property %q: %w", key, err)
+			}
+			props[key] = propMap
+		}
+		result["properties"] = props
+	}
+
+	if schema.Items != nil {
+		items, err := schemaToMap(schema.Items)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert items: %w", err)
+		}
+		result["items"] = items
+	}
+
+	if len(schema.Required) > 0 {
+		result["required"] = schema.Required
+	}
+
+	if len(schema.Enum) > 0 {
+		result["enum"] = schema.Enum
+	}
+
+	if schema.Format != "" {
+		result["format"] = schema.Format
+	}
+
+	if schema.Pattern != "" {
+		result["pattern"] = schema.Pattern
+	}
+
+	if schema.Minimum != nil {
+		result["minimum"] = *schema.Minimum
+	}
+
+	if schema.Maximum != nil {
+		result["maximum"] = *schema.Maximum
+	}
+
+	if schema.MinLength != nil {
+		result["minLength"] = *schema.MinLength
+	}
+
+	if schema.MaxLength != nil {
+		result["maxLength"] = *schema.MaxLength
+	}
+
+	if schema.MinItems != nil {
+		result["minItems"] = *schema.MinItems
+	}
+
+	if schema.MaxItems != nil {
+		result["maxItems"] = *schema.MaxItems
+	}
+
+	if schema.MinProperties != nil {
+		result["minProperties"] = *schema.MinProperties
+	}
+
+	if schema.MaxProperties != nil {
+		result["maxProperties"] = *schema.MaxProperties
+	}
+
+	if schema.Nullable != nil {
+		result["nullable"] = *schema.Nullable
+	}
+
+	if schema.Default != nil {
+		result["default"] = schema.Default
+	}
+
+	if schema.Example != nil {
+		result["example"] = schema.Example
+	}
+
+	if len(schema.PropertyOrdering) > 0 {
+		result["propertyOrdering"] = schema.PropertyOrdering
+	}
+
+	if len(schema.AnyOf) > 0 {
+		anyOf := make([]any, len(schema.AnyOf))
+		for i, s := range schema.AnyOf {
+			schemaMap, err := schemaToMap(s)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert anyOf[%d]: %w", i, err)
+			}
+			anyOf[i] = schemaMap
+		}
+		result["anyOf"] = anyOf
+	}
+
+	return result, nil
+}
+
 func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 	var fantasyTools []fantasy.Tool
 	var errs []error
@@ -284,7 +420,12 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 			for _, fn := range tool.FunctionDeclarations {
 				params := make(map[string]any)
 				if fn.Parameters != nil {
-					errs = append(errs, errors.New("schema to map conversion not implemented"))
+					schemaMap, err := schemaToMap(fn.Parameters)
+					if err != nil {
+						errs = append(errs, fmt.Errorf("failed to convert schema for function %q: %w", fn.Name, err))
+					} else if schemaMap != nil {
+						params = schemaMap
+					}
 				}
 				fantasyTools = append(fantasyTools, fantasy.FunctionTool{
 					Name:        fn.Name,
@@ -320,7 +461,7 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
 	llmResp := &model.LLMResponse{
 		Content: &genai.Content{
-			Role:  "model",
+			Role:  RoleModel,
 			Parts: make([]*genai.Part, 0, len(resp.Content)),
 		},
 		CitationMetadata:  nil,
@@ -349,10 +490,18 @@ func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
 				Text: c.Text,
 			})
 		case fantasy.ToolCallContent:
+			args := make(map[string]any)
+			if c.Input != "" {
+				if err := json.Unmarshal([]byte(c.Input), &args); err != nil {
+					llmResp.ErrorCode = ErrorCodeUnmarshal
+					llmResp.ErrorMessage = fmt.Sprintf("failed to unmarshal tool call input: %v", err)
+				}
+			}
 			llmResp.Content.Parts = append(llmResp.Content.Parts, &genai.Part{
 				FunctionCall: &genai.FunctionCall{
 					ID:   c.ToolCallID,
 					Name: c.ToolName,
+					Args: args,
 				},
 			})
 		case fantasy.ReasoningContent:
@@ -380,6 +529,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 		var currentContent *genai.Content
 		var currentPart *genai.Part
 		var partIndex int
+		toolInputAccumulator := make(map[string]*strings.Builder)
 
 		for part := range stream {
 			switch part.Type {
@@ -410,7 +560,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 
 			case fantasy.StreamPartTypeTextStart:
 				if currentContent == nil {
-					currentContent = &genai.Content{Role: "model", Parts: []*genai.Part{}}
+					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
 				}
 				currentPart = &genai.Part{Text: ""}
 				currentContent.Parts = append(currentContent.Parts, currentPart)
@@ -443,7 +593,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 
 			case fantasy.StreamPartTypeToolInputStart:
 				if currentContent == nil {
-					currentContent = &genai.Content{Role: "model", Parts: []*genai.Part{}}
+					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
 				}
 				currentPart = &genai.Part{
 					FunctionCall: &genai.FunctionCall{
@@ -453,16 +603,47 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 					},
 				}
 				currentContent.Parts = append(currentContent.Parts, currentPart)
+				toolInputAccumulator[part.ID] = &strings.Builder{}
 
 			case fantasy.StreamPartTypeToolInputDelta:
+				if builder, ok := toolInputAccumulator[part.ID]; ok {
+					builder.WriteString(part.ToolCallInput)
+				}
 
 			case fantasy.StreamPartTypeToolInputEnd, fantasy.StreamPartTypeToolCall:
+				if builder, ok := toolInputAccumulator[part.ID]; ok {
+					if currentPart != nil && currentPart.FunctionCall != nil {
+						jsonStr := builder.String()
+						if jsonStr != "" {
+							if err := json.Unmarshal([]byte(jsonStr), &currentPart.FunctionCall.Args); err != nil {
+								if !yield(&model.LLMResponse{
+									Content:           nil,
+									CitationMetadata:  nil,
+									GroundingMetadata: nil,
+									UsageMetadata:     nil,
+									CustomMetadata:    nil,
+									LogprobsResult:    nil,
+									Partial:           false,
+									TurnComplete:      true,
+									Interrupted:       false,
+									ErrorCode:         "UNMARSHAL_ERROR",
+									ErrorMessage:      fmt.Sprintf("failed to unmarshal tool input: %v", err),
+									FinishReason:      genai.FinishReasonOther,
+									AvgLogprobs:       0,
+								}, err) {
+									return
+								}
+							}
+						}
+					}
+					delete(toolInputAccumulator, part.ID)
+				}
 				currentPart = nil
 				partIndex++
 
 			case fantasy.StreamPartTypeReasoningStart:
 				if currentContent == nil {
-					currentContent = &genai.Content{Role: "model", Parts: []*genai.Part{}}
+					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
 				}
 				currentPart = &genai.Part{Text: "", Thought: true}
 				currentContent.Parts = append(currentContent.Parts, currentPart)

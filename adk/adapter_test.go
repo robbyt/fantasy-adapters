@@ -2,6 +2,7 @@ package adk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
@@ -1003,14 +1004,546 @@ func TestGenaiToolsToFantasyTools_WithParameters(t *testing.T) {
 				{
 					Name:        "test-function",
 					Description: "test description",
-					Parameters:  &genai.Schema{Type: "object"},
+					Parameters:  &genai.Schema{Type: "OBJECT"},
 				},
 			},
 		},
 	}
 
-	_, err := genaiToolsToFantasyTools(tools)
-	require.Error(t, err)
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+	assert.Equal(t, "test-function", ft.Name)
+	assert.Equal(t, "test description", ft.Description)
+	require.NotNil(t, ft.InputSchema)
+	assert.Equal(t, "OBJECT", ft.InputSchema["type"])
+}
+
+func TestSchemaToMap_NilSchema(t *testing.T) {
+	result, err := schemaToMap(nil)
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+func TestSchemaToMap_BasicTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		schema   *genai.Schema
+		expected map[string]any
+	}{
+		{
+			name:     "string type",
+			schema:   &genai.Schema{Type: "STRING", Description: "A string value"},
+			expected: map[string]any{"type": "STRING", "description": "A string value"},
+		},
+		{
+			name:     "number type with format",
+			schema:   &genai.Schema{Type: "NUMBER", Format: "float"},
+			expected: map[string]any{"type": "NUMBER", "format": "float"},
+		},
+		{
+			name:     "boolean type",
+			schema:   &genai.Schema{Type: "BOOLEAN"},
+			expected: map[string]any{"type": "BOOLEAN"},
+		},
+		{
+			name:     "integer with min/max",
+			schema:   &genai.Schema{Type: "INTEGER", Minimum: genai.Ptr(1.0), Maximum: genai.Ptr(100.0)},
+			expected: map[string]any{"type": "INTEGER", "minimum": 1.0, "maximum": 100.0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := schemaToMap(tt.schema)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestSchemaToMap_ObjectWithProperties(t *testing.T) {
+	schema := &genai.Schema{
+		Type:        "OBJECT",
+		Description: "A person object",
+		Properties: map[string]*genai.Schema{
+			"name": {Type: "STRING", Description: "Person's name"},
+			"age":  {Type: "INTEGER", Description: "Person's age"},
+		},
+		Required: []string{"name"},
+	}
+
+	result, err := schemaToMap(schema)
+	require.NoError(t, err)
+	assert.Equal(t, "OBJECT", result["type"])
+	assert.Equal(t, "A person object", result["description"])
+	assert.Contains(t, result, "properties")
+	assert.Contains(t, result, "required")
+	assert.Equal(t, []string{"name"}, result["required"])
+
+	props, ok := result["properties"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, props, "name")
+	assert.Contains(t, props, "age")
+}
+
+func TestSchemaToMap_ArrayWithItems(t *testing.T) {
+	schema := &genai.Schema{
+		Type: "ARRAY",
+		Items: &genai.Schema{
+			Type:        "STRING",
+			Description: "String item",
+		},
+	}
+
+	result, err := schemaToMap(schema)
+	require.NoError(t, err)
+	assert.Equal(t, "ARRAY", result["type"])
+	assert.Contains(t, result, "items")
+
+	items, ok := result["items"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "STRING", items["type"])
+	assert.Equal(t, "String item", items["description"])
+}
+
+func TestSchemaToMap_WithEnum(t *testing.T) {
+	schema := &genai.Schema{
+		Type: "STRING",
+		Enum: []string{"red", "green", "blue"},
+	}
+
+	result, err := schemaToMap(schema)
+	require.NoError(t, err)
+	assert.Equal(t, "STRING", result["type"])
+	assert.Equal(t, []string{"red", "green", "blue"}, result["enum"])
+}
+
+func TestSchemaToMap_NestedObjects(t *testing.T) {
+	schema := &genai.Schema{
+		Type: "OBJECT",
+		Properties: map[string]*genai.Schema{
+			"address": {
+				Type: "OBJECT",
+				Properties: map[string]*genai.Schema{
+					"street": {Type: "STRING"},
+					"city":   {Type: "STRING"},
+				},
+			},
+		},
+	}
+
+	result, err := schemaToMap(schema)
+	require.NoError(t, err)
+
+	props, ok := result["properties"].(map[string]any)
+	require.True(t, ok)
+
+	address, ok := props["address"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "OBJECT", address["type"])
+
+	addressProps, ok := address["properties"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, addressProps, "street")
+	assert.Contains(t, addressProps, "city")
+}
+
+func TestGenaiContentToFantasyMessage_FunctionCallSerialization(t *testing.T) {
+	content := &genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{
+			{
+				FunctionCall: &genai.FunctionCall{
+					ID:   "call-123",
+					Name: "get_weather",
+					Args: map[string]any{
+						"location": "San Francisco",
+						"unit":     "celsius",
+					},
+				},
+			},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
+
+	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-123", toolCall.ToolCallID)
+	assert.Equal(t, "get_weather", toolCall.ToolName)
+
+	var args map[string]any
+	err = json.Unmarshal([]byte(toolCall.Input), &args)
+	require.NoError(t, err)
+	assert.Equal(t, "San Francisco", args["location"])
+	assert.Equal(t, "celsius", args["unit"])
+}
+
+func TestGenaiContentToFantasyMessage_FunctionCallEmptyArgs(t *testing.T) {
+	content := &genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{
+			{
+				FunctionCall: &genai.FunctionCall{
+					ID:   "call-456",
+					Name: "get_time",
+					Args: nil,
+				},
+			},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
+
+	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-456", toolCall.ToolCallID)
+	assert.Equal(t, "get_time", toolCall.ToolName)
+	assert.Empty(t, toolCall.Input)
+}
+
+func TestGenaiContentToFantasyMessage_FunctionResponseSerialization(t *testing.T) {
+	content := &genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{
+			{
+				FunctionResponse: &genai.FunctionResponse{
+					ID:   "call-789",
+					Name: "get_weather",
+					Response: map[string]any{
+						"temperature": 72,
+						"condition":   "sunny",
+						"humidity":    65,
+					},
+				},
+			},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
+
+	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-789", toolResult.ToolCallID)
+
+	textOutput, ok := toolResult.Output.(fantasy.ToolResultOutputContentText)
+	require.True(t, ok)
+
+	var response map[string]any
+	err = json.Unmarshal([]byte(textOutput.Text), &response)
+	require.NoError(t, err)
+	assert.InDelta(t, 72.0, response["temperature"], 0.001)
+	assert.Equal(t, "sunny", response["condition"])
+	assert.InDelta(t, 65.0, response["humidity"], 0.001)
+}
+
+func TestGenaiContentToFantasyMessage_FunctionResponseEmptyResponse(t *testing.T) {
+	content := &genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{
+			{
+				FunctionResponse: &genai.FunctionResponse{
+					ID:       "call-999",
+					Name:     "get_status",
+					Response: nil,
+				},
+			},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	require.NoError(t, err)
+	require.Len(t, msg.Content, 1)
+
+	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-999", toolResult.ToolCallID)
+
+	textOutput, ok := toolResult.Output.(fantasy.ToolResultOutputContentText)
+	require.True(t, ok)
+	assert.Empty(t, textOutput.Text)
+}
+
+func TestFantasyResponseToLLM_ToolCallDeserialization(t *testing.T) {
+	resp := &fantasy.Response{
+		Content: []fantasy.Content{
+			fantasy.ToolCallContent{
+				ToolCallID: "call-abc",
+				ToolName:   "calculate",
+				Input:      `{"operation":"add","numbers":[1,2,3]}`,
+			},
+		},
+	}
+
+	llmResp := fantasyResponseToLLM(resp)
+	require.NotNil(t, llmResp.Content)
+	require.Len(t, llmResp.Content.Parts, 1)
+
+	part := llmResp.Content.Parts[0]
+	require.NotNil(t, part.FunctionCall)
+	assert.Equal(t, "call-abc", part.FunctionCall.ID)
+	assert.Equal(t, "calculate", part.FunctionCall.Name)
+	assert.Equal(t, "add", part.FunctionCall.Args["operation"])
+	assert.Equal(t, []any{float64(1), float64(2), float64(3)}, part.FunctionCall.Args["numbers"])
+}
+
+func TestFantasyResponseToLLM_ToolCallEmptyInput(t *testing.T) {
+	resp := &fantasy.Response{
+		Content: []fantasy.Content{
+			fantasy.ToolCallContent{
+				ToolCallID: "call-def",
+				ToolName:   "get_status",
+				Input:      "",
+			},
+		},
+	}
+
+	llmResp := fantasyResponseToLLM(resp)
+	require.NotNil(t, llmResp.Content)
+	require.Len(t, llmResp.Content.Parts, 1)
+
+	part := llmResp.Content.Parts[0]
+	require.NotNil(t, part.FunctionCall)
+	assert.Equal(t, "call-def", part.FunctionCall.ID)
+	assert.Equal(t, "get_status", part.FunctionCall.Name)
+	assert.Empty(t, part.FunctionCall.Args)
+}
+
+func TestFantasyResponseToLLM_ToolCallInvalidJSON(t *testing.T) {
+	resp := &fantasy.Response{
+		Content: []fantasy.Content{
+			fantasy.ToolCallContent{
+				ToolCallID: "call-ghi",
+				ToolName:   "parse_data",
+				Input:      `{invalid json}`,
+			},
+		},
+	}
+
+	llmResp := fantasyResponseToLLM(resp)
+	require.NotNil(t, llmResp)
+	assert.Equal(t, ErrorCodeUnmarshal, llmResp.ErrorCode)
+	assert.Contains(t, llmResp.ErrorMessage, "failed to unmarshal tool call input")
+}
+
+func TestFantasyStreamToLLM_ToolInputAccumulation(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-xyz",
+			ToolCallName: "search",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-xyz",
+			ToolCallInput: `{"query":`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-xyz",
+			ToolCallInput: `"golang best practices"`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-xyz",
+			ToolCallInput: `,"limit":10}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-xyz",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundToolCall bool
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil && part.FunctionCall.Name == "search" {
+					foundToolCall = true
+					assert.Equal(t, "call-xyz", part.FunctionCall.ID)
+					assert.Equal(t, "search", part.FunctionCall.Name)
+					assert.Equal(t, "golang best practices", part.FunctionCall.Args["query"])
+					assert.InDelta(t, 10.0, part.FunctionCall.Args["limit"], 0.001)
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundToolCall, "Expected to find accumulated tool call in stream")
+}
+
+func TestFantasyStreamToLLM_MultipleToolCallsAccumulation(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-1",
+			ToolCallName: "tool1",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-1",
+			ToolCallInput: `{"arg1":`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-1",
+			ToolCallInput: `"value1"}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-1",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-2",
+			ToolCallName: "tool2",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-2",
+			ToolCallInput: `{"arg2":`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-2",
+			ToolCallInput: `"value2"}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-2",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	foundCalls := make(map[string]bool)
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil {
+					foundCalls[part.FunctionCall.Name] = true
+					switch part.FunctionCall.Name {
+					case "tool1":
+						assert.Equal(t, "value1", part.FunctionCall.Args["arg1"])
+					case "tool2":
+						assert.Equal(t, "value2", part.FunctionCall.Args["arg2"])
+					}
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundCalls["tool1"], "Expected to find tool1 call")
+	assert.True(t, foundCalls["tool2"], "Expected to find tool2 call")
+}
+
+func TestFantasyStreamToLLM_ToolInputInvalidJSON(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-bad",
+			ToolCallName: "bad_tool",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-bad",
+			ToolCallInput: `{invalid`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-bad",
+			ToolCallInput: ` json}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-bad",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundError bool
+	for resp, err := range iter {
+		if err != nil && resp != nil && resp.ErrorCode == ErrorCodeUnmarshal {
+			foundError = true
+			assert.Contains(t, resp.ErrorMessage, "failed to unmarshal tool input")
+			continue
+		}
+		if err != nil {
+			continue
+		}
+	}
+
+	assert.True(t, foundError, "Expected to find unmarshal error for invalid JSON")
 }
 
 func TestAnthropicProvider_Implements_ModelLLM(t *testing.T) {
