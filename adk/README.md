@@ -75,11 +75,19 @@ func main() {
 - ✅ Temperature, TopP, TopK
 - ✅ MaxOutputTokens
 - ✅ System instructions
-- ✅ Tool/function calling
+- ✅ Tool/function calling (with JSON serialization)
 - ✅ Tool choice modes (auto, required, none, specific tool)
 - ✅ Multi-turn conversations
 - ✅ Image inputs (inline data)
 - ✅ Token usage tracking
+
+### Tool/Function Calling
+
+The adapter supports tool calling with the following implementation:
+- Function arguments are serialized as JSON strings for transport
+- Function responses are serialized as JSON strings
+- Streaming tool input accumulation is fully supported
+- Tool parameters use JSON Schema format (OpenAPI 3.0 compatible)
 
 ## Unsupported Features
 
