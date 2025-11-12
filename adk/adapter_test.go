@@ -149,20 +149,26 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 	m := new(MockLanguageModel)
 
 	streamFunc := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeTextStart,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:  fantasy.StreamPartTypeTextDelta,
 			ID:    "0",
 			Delta: "test",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeTextEnd,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonStop,
 			Usage: fantasy.Usage{
@@ -170,7 +176,9 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 				OutputTokens: 4,
 				TotalTokens:  14,
 			},
-		})
+		}) {
+			return
+		}
 	}
 
 	m.On("Stream", mock.Anything, mock.MatchedBy(func(call fantasy.Call) bool {
@@ -408,25 +416,33 @@ func TestFantasyResponseToLLM(t *testing.T) {
 
 func TestFantasyStreamToLLM(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeTextStart,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:  fantasy.StreamPartTypeTextDelta,
 			ID:    "0",
 			Delta: "hello",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:  fantasy.StreamPartTypeTextDelta,
 			ID:    "0",
 			Delta: " world",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeTextEnd,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonStop,
 			Usage: fantasy.Usage{
@@ -434,7 +450,9 @@ func TestFantasyStreamToLLM(t *testing.T) {
 				OutputTokens: 2,
 				TotalTokens:  7,
 			},
-		})
+		}) {
+			return
+		}
 	}
 
 	iter := fantasyStreamToLLM(stream)
@@ -454,24 +472,32 @@ func TestFantasyStreamToLLM(t *testing.T) {
 
 func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeReasoningStart,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:  fantasy.StreamPartTypeReasoningDelta,
 			ID:    "0",
 			Delta: "thinking...",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeReasoningEnd,
 			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonStop,
 			Usage:        fantasy.Usage{},
-		})
+		}) {
+			return
+		}
 	}
 
 	iter := fantasyStreamToLLM(stream)
@@ -810,25 +836,33 @@ func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 
 func TestFantasyStreamToLLM_ToolCalls(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeToolInputStart,
 			ID:           "call-123",
 			ToolCallName: "test-func",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:          fantasy.StreamPartTypeToolInputDelta,
 			ID:            "call-123",
 			ToolCallInput: `{"arg":"value"}`,
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type: fantasy.StreamPartTypeToolInputEnd,
 			ID:   "call-123",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonToolCalls,
 			Usage:        fantasy.Usage{},
-		})
+		}) {
+			return
+		}
 	}
 
 	iter := fantasyStreamToLLM(stream)
@@ -939,16 +973,20 @@ func TestGenaiContentToFantasyMessage_CodeExecutionResult(t *testing.T) {
 
 func TestFantasyStreamToLLM_ToolCall(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeToolCall,
 			ID:           "call-123",
 			ToolCallName: "test-func",
-		})
-		yield(fantasy.StreamPart{
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonStop,
 			Usage:        fantasy.Usage{},
-		})
+		}) {
+			return
+		}
 	}
 
 	iter := fantasyStreamToLLM(stream)
