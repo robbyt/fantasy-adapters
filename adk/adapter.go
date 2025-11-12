@@ -47,6 +47,11 @@ const (
 	ErrorCodeGeneric   = "ERROR"
 	ErrorCodeUnmarshal = "UNMARSHAL_ERROR"
 	RoleModel          = "model"
+
+	ToolModeAuto      = "AUTO"
+	ToolModeAny       = "ANY"
+	ToolModeNone      = "NONE"
+	ToolModeValidated = "VALIDATED"
 )
 
 // NewAdapter creates a new ADK adapter for the given fantasy language model.
@@ -185,16 +190,16 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 		if req.Config.ToolConfig != nil && req.Config.ToolConfig.FunctionCallingConfig != nil {
 			fc := req.Config.ToolConfig.FunctionCallingConfig
 			switch fc.Mode {
-			case "AUTO":
+			case ToolModeAuto:
 				tc := fantasy.ToolChoiceAuto
 				call.ToolChoice = &tc
-			case "ANY":
+			case ToolModeAny:
 				tc := fantasy.ToolChoiceRequired
 				call.ToolChoice = &tc
-			case "NONE":
+			case ToolModeNone:
 				tc := fantasy.ToolChoiceNone
 				call.ToolChoice = &tc
-			case "VALIDATED":
+			case ToolModeValidated:
 				errs = append(errs, errors.New("validated tool mode not supported"))
 			}
 
@@ -538,7 +543,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 				errCode := ""
 				if part.Error != nil {
 					errMsg = part.Error.Error()
-					errCode = "ERROR"
+					errCode = ErrorCodeGeneric
 				}
 				if !yield(&model.LLMResponse{
 					Content:           nil,
