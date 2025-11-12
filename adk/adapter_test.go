@@ -1504,6 +1504,103 @@ func TestFantasyStreamToLLM_ToolInputAccumulation(t *testing.T) {
 	assert.True(t, foundToolCall, "Expected to find accumulated tool call in stream")
 }
 
+func TestFantasyStreamToLLM_ToolInputNestedObjects(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-nested",
+			ToolCallName: "configure",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-nested",
+			ToolCallInput: `{"config":{"timeout":`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-nested",
+			ToolCallInput: `30,"retries":3},`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-nested",
+			ToolCallInput: `"users":[{"id":1,`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-nested",
+			ToolCallInput: `"name":"Alice","active":true}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-nested",
+			ToolCallInput: `]}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-nested",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundToolCall bool
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil && part.FunctionCall.Name == "configure" {
+					foundToolCall = true
+					assert.Equal(t, "call-nested", part.FunctionCall.ID)
+					assert.Equal(t, "configure", part.FunctionCall.Name)
+
+					// Marshal the Args back to JSON and compare with expected JSON
+					argsJSON, err := json.Marshal(part.FunctionCall.Args)
+					require.NoError(t, err)
+
+					expectedJSON := `{
+						"config": {
+							"timeout": 30,
+							"retries": 3
+						},
+						"users": [
+							{
+								"id": 1,
+								"name": "Alice",
+								"active": true
+							}
+						]
+					}`
+					assert.JSONEq(t, expectedJSON, string(argsJSON))
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundToolCall, "Expected to find accumulated tool call with nested objects in stream")
+}
+
 func TestFantasyStreamToLLM_MultipleToolCallsAccumulation(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
 		if !yield(fantasy.StreamPart{
