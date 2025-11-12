@@ -1,0 +1,46 @@
+name: Go
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: adk/go.mod
+          cache: true
+          cache-dependency-path: adk/go.sum
+
+      - name: Display Go version
+        run: go version
+
+      - name: go mod tidy (fails if changes are needed)
+        working-directory: adk
+        run: go mod tidy --diff
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          cache-invalidation-interval: 30
+          working-directory: adk
+
+      - name: Go test
+        working-directory: adk
+        run: |
+          go test -short -timeout 1m ./...
+          go test -race -cover -coverprofile=unit.coverage.out -timeout 5m ./...
