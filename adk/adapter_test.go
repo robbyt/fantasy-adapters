@@ -15,31 +15,77 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"charm.land/fantasy/providers/openrouter"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
 
-type mockLanguageModel struct {
-	provider     string
-	modelID      string
-	generateFunc func(ctx context.Context, call fantasy.Call) (*fantasy.Response, error)
-	streamFunc   func(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error)
+type MockLanguageModel struct {
+	mock.Mock
 }
 
-func (m *mockLanguageModel) Provider() string {
-	return m.provider
+func (m *MockLanguageModel) Provider() string {
+	args := m.Called()
+	return args.String(0)
 }
 
-func (m *mockLanguageModel) Model() string {
-	return m.modelID
+func (m *MockLanguageModel) Model() string {
+	args := m.Called()
+	return args.String(0)
 }
 
-func (m *mockLanguageModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Response, error) {
-	if m.generateFunc != nil {
-		return m.generateFunc(ctx, call)
+func (m *MockLanguageModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Response, error) {
+	args := m.Called(ctx, call)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
 	}
-	return &fantasy.Response{
+	return args.Get(0).(*fantasy.Response), args.Error(1)
+}
+
+func (m *MockLanguageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	args := m.Called(ctx, call)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(fantasy.StreamResponse), args.Error(1)
+}
+
+func TestNewAdapter(t *testing.T) {
+	m := new(MockLanguageModel)
+
+	adapter := NewAdapter(m)
+	require.NotNil(t, adapter)
+	require.IsType(t, &Adapter{}, adapter)
+
+	adapterImpl := adapter.(*Adapter)
+	assert.Equal(t, m, adapterImpl.model)
+}
+
+func TestAdapter_Implements_ModelLLM_Interface(t *testing.T) {
+	m := new(MockLanguageModel)
+
+	adapter := NewAdapter(m)
+
+	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestAdapter_Name(t *testing.T) {
+	m := new(MockLanguageModel)
+	m.On("Provider").Return("test-provider")
+	m.On("Model").Return("test-model")
+	defer m.AssertExpectations(t)
+
+	adapter := &Adapter{model: m}
+	name := adapter.Name()
+
+	assert.Equal(t, "test-provider/test-model", name)
+}
+
+func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
+	m := new(MockLanguageModel)
+
+	expectedResponse := &fantasy.Response{
 		Content: []fantasy.Content{
 			fantasy.TextContent{Text: "test response"},
 		},
@@ -49,83 +95,16 @@ func (m *mockLanguageModel) Generate(ctx context.Context, call fantasy.Call) (*f
 			TotalTokens:  30,
 		},
 		FinishReason: fantasy.FinishReasonStop,
-	}, nil
-}
-
-func (m *mockLanguageModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
-	if m.streamFunc != nil {
-		return m.streamFunc(ctx, call)
-	}
-	return func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextStart,
-			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeTextDelta,
-			ID:    "0",
-			Delta: "test",
-		})
-		yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextEnd,
-			ID:   "0",
-		})
-		yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonStop,
-			Usage: fantasy.Usage{
-				InputTokens:  10,
-				OutputTokens: 4,
-				TotalTokens:  14,
-			},
-		})
-	}, nil
-}
-
-func TestNewAdapter(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test-provider",
-		modelID:  "test-model",
 	}
 
-	adapter := NewAdapter(mock)
-	require.NotNil(t, adapter)
-	require.IsType(t, &Adapter{}, adapter)
+	m.On("Generate", mock.Anything, mock.MatchedBy(func(call fantasy.Call) bool {
+		return len(call.Prompt) == 1 &&
+			call.Prompt[0].Role == fantasy.MessageRoleUser &&
+			len(call.Prompt[0].Content) == 1
+	})).Return(expectedResponse, nil)
+	defer m.AssertExpectations(t)
 
-	adapterImpl := adapter.(*Adapter)
-	assert.Equal(t, mock, adapterImpl.model)
-}
-
-func TestAdapter_Implements_ModelLLM_Interface(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test-provider",
-		modelID:  "test-model",
-	}
-
-	adapter := NewAdapter(mock)
-
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestAdapter_Name(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test-provider",
-		modelID:  "test-model",
-	}
-
-	adapter := &Adapter{model: mock}
-	name := adapter.Name()
-
-	assert.Equal(t, "test-provider/test-model", name)
-}
-
-func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test",
-		modelID:  "model",
-	}
-
-	adapter := &Adapter{model: mock}
+	adapter := &Adapter{model: m}
 	req := &model.LLMRequest{
 		Model: "test/model",
 		Contents: []*genai.Content{
@@ -158,15 +137,49 @@ func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
 	assert.Equal(t, "test response", resp.Content.Parts[0].Text)
 	assert.True(t, resp.TurnComplete)
 	assert.False(t, resp.Partial)
+
+	require.NotNil(t, resp.UsageMetadata)
+	assert.Equal(t, int32(10), resp.UsageMetadata.PromptTokenCount)
+	assert.Equal(t, int32(20), resp.UsageMetadata.CandidatesTokenCount)
+	assert.Equal(t, int32(30), resp.UsageMetadata.TotalTokenCount)
+	assert.Equal(t, genai.FinishReasonStop, resp.FinishReason)
 }
 
 func TestAdapter_GenerateContent_Streaming(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test",
-		modelID:  "model",
+	m := new(MockLanguageModel)
+
+	streamFunc := func(yield func(fantasy.StreamPart) bool) {
+		yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextStart,
+			ID:   "0",
+		})
+		yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "test",
+		})
+		yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextEnd,
+			ID:   "0",
+		})
+		yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonStop,
+			Usage: fantasy.Usage{
+				InputTokens:  10,
+				OutputTokens: 4,
+				TotalTokens:  14,
+			},
+		})
 	}
 
-	adapter := &Adapter{model: mock}
+	m.On("Stream", mock.Anything, mock.MatchedBy(func(call fantasy.Call) bool {
+		return len(call.Prompt) == 1 &&
+			call.Prompt[0].Role == fantasy.MessageRoleUser
+	})).Return(fantasy.StreamResponse(streamFunc), nil)
+	defer m.AssertExpectations(t)
+
+	adapter := &Adapter{model: m}
 	req := &model.LLMRequest{
 		Model: "test/model",
 		Contents: []*genai.Content{
@@ -192,6 +205,10 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 
 	finalResp := responses[len(responses)-1]
 	assert.True(t, finalResp.TurnComplete)
+	require.NotNil(t, finalResp.UsageMetadata)
+	assert.Equal(t, int32(10), finalResp.UsageMetadata.PromptTokenCount)
+	assert.Equal(t, int32(4), finalResp.UsageMetadata.CandidatesTokenCount)
+	assert.Equal(t, int32(14), finalResp.UsageMetadata.TotalTokenCount)
 }
 
 func TestLlmRequestToFantasyCall_Basic(t *testing.T) {
@@ -707,12 +724,9 @@ func TestGenaiContentToFantasyMessage_VideoMetadata(t *testing.T) {
 }
 
 func TestAdapter_GenerateContent_RequestError(t *testing.T) {
-	mock := &mockLanguageModel{
-		provider: "test",
-		modelID:  "model",
-	}
+	m := new(MockLanguageModel)
 
-	adapter := &Adapter{model: mock}
+	adapter := &Adapter{model: m}
 	req := &model.LLMRequest{
 		Config: &genai.GenerateContentConfig{
 			SafetySettings: []*genai.SafetySetting{{}},
@@ -732,15 +746,12 @@ func TestAdapter_GenerateContent_RequestError(t *testing.T) {
 
 func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 	testErr := errors.New("generate error")
-	mock := &mockLanguageModel{
-		provider: "test",
-		modelID:  "model",
-		generateFunc: func(ctx context.Context, call fantasy.Call) (*fantasy.Response, error) {
-			return nil, testErr
-		},
-	}
+	m := new(MockLanguageModel)
 
-	adapter := &Adapter{model: mock}
+	m.On("Generate", mock.Anything, mock.Anything).Return(nil, testErr)
+	defer m.AssertExpectations(t)
+
+	adapter := &Adapter{model: m}
 	req := &model.LLMRequest{
 		Model: "test/model",
 		Contents: []*genai.Content{
@@ -767,15 +778,12 @@ func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 
 func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 	testErr := errors.New("stream error")
-	mock := &mockLanguageModel{
-		provider: "test",
-		modelID:  "model",
-		streamFunc: func(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
-			return nil, testErr
-		},
-	}
+	m := new(MockLanguageModel)
 
-	adapter := &Adapter{model: mock}
+	m.On("Stream", mock.Anything, mock.Anything).Return(nil, testErr)
+	defer m.AssertExpectations(t)
+
+	adapter := &Adapter{model: m}
 	req := &model.LLMRequest{
 		Model: "test/model",
 		Contents: []*genai.Content{
