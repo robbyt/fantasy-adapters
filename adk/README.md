@@ -99,7 +99,6 @@ The following ADK features are not supported and will return errors:
 - Cached content references
 - File data (URI references)
 - Retrieval tools (Google Search, Vertex AI Search)
-- Computer use
 - Code execution
 - Video metadata
 - Multiple allowed function names (only single tool selection supported)
