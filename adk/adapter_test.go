@@ -314,55 +314,59 @@ func TestGenaiContentToFantasyMessage(t *testing.T) {
 	tests := []struct {
 		name        string
 		content     *genai.Content
-		role        fantasy.MessageRole
+		expectRole  fantasy.MessageRole
 		expectParts int
 		expectErr   bool
 	}{
 		{
 			name: "text part",
 			content: &genai.Content{
+				Role: "user",
 				Parts: []*genai.Part{
 					{Text: "hello"},
 				},
 			},
-			role:        fantasy.MessageRoleUser,
+			expectRole:  fantasy.MessageRoleUser,
 			expectParts: 1,
 		},
 		{
 			name: "thought part",
 			content: &genai.Content{
+				Role: "model",
 				Parts: []*genai.Part{
 					{Text: "thinking...", Thought: true},
 				},
 			},
-			role:        fantasy.MessageRoleAssistant,
+			expectRole:  fantasy.MessageRoleAssistant,
 			expectParts: 1,
 		},
 		{
 			name: "inline data",
 			content: &genai.Content{
+				Role: "user",
 				Parts: []*genai.Part{
 					{InlineData: &genai.Blob{Data: []byte("data"), MIMEType: "image/png"}},
 				},
 			},
-			role:        fantasy.MessageRoleUser,
+			expectRole:  fantasy.MessageRoleUser,
 			expectParts: 1,
 		},
 		{
 			name: "file data URI",
 			content: &genai.Content{
+				Role: "user",
 				Parts: []*genai.Part{
 					{FileData: &genai.FileData{FileURI: "gs://bucket/file"}},
 				},
 			},
-			role:      fantasy.MessageRoleUser,
-			expectErr: true,
+			expectRole: fantasy.MessageRoleUser,
+			expectErr:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			msg, err := genaiContentToFantasyMessage(tt.content, tt.role)
+			msg, err := genaiContentToFantasyMessage(tt.content)
 
 			if tt.expectErr {
 				require.Error(t, err)
@@ -371,7 +375,7 @@ func TestGenaiContentToFantasyMessage(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Len(t, msg.Content, tt.expectParts)
-			assert.Equal(t, tt.role, msg.Role)
+			assert.Equal(t, tt.expectRole, msg.Role)
 		})
 	}
 }
@@ -790,6 +794,7 @@ func TestLlmRequestToFantasyCall_ToolConfigAndFiltering(t *testing.T) {
 
 func TestGenaiContentToFantasyMessage_FunctionCall(t *testing.T) {
 	content := &genai.Content{
+		Role: "model",
 		Parts: []*genai.Part{
 			{
 				FunctionCall: &genai.FunctionCall{
@@ -800,9 +805,10 @@ func TestGenaiContentToFantasyMessage_FunctionCall(t *testing.T) {
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleAssistant)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleAssistant, msg.Role)
 
 	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
 	require.True(t, ok)
@@ -821,9 +827,10 @@ func TestGenaiContentToFantasyMessage_FunctionResponse(t *testing.T) {
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleTool, msg.Role)
 
 	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
 	require.True(t, ok)
@@ -837,7 +844,7 @@ func TestGenaiContentToFantasyMessage_ExecutableCode(t *testing.T) {
 		},
 	}
 
-	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	_, err := genaiContentToFantasyMessage(content)
 	require.Error(t, err)
 }
 
@@ -848,7 +855,7 @@ func TestGenaiContentToFantasyMessage_VideoMetadata(t *testing.T) {
 		},
 	}
 
-	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	_, err := genaiContentToFantasyMessage(content)
 	require.Error(t, err)
 }
 
@@ -1070,7 +1077,7 @@ func TestGenaiContentToFantasyMessage_CodeExecutionResult(t *testing.T) {
 		},
 	}
 
-	_, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	_, err := genaiContentToFantasyMessage(content)
 	require.Error(t, err)
 }
 
@@ -1271,9 +1278,10 @@ func TestGenaiContentToFantasyMessage_FunctionCallSerialization(t *testing.T) {
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleUser, msg.Role)
 
 	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
 	require.True(t, ok)
@@ -1301,9 +1309,10 @@ func TestGenaiContentToFantasyMessage_FunctionCallEmptyArgs(t *testing.T) {
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleUser, msg.Role)
 
 	toolCall, ok := msg.Content[0].(fantasy.ToolCallPart)
 	require.True(t, ok)
@@ -1330,9 +1339,10 @@ func TestGenaiContentToFantasyMessage_FunctionResponseSerialization(t *testing.T
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleTool, msg.Role)
 
 	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
 	require.True(t, ok)
@@ -1363,9 +1373,10 @@ func TestGenaiContentToFantasyMessage_FunctionResponseEmptyResponse(t *testing.T
 		},
 	}
 
-	msg, err := genaiContentToFantasyMessage(content, fantasy.MessageRoleUser)
+	msg, err := genaiContentToFantasyMessage(content)
 	require.NoError(t, err)
 	require.Len(t, msg.Content, 1)
+	assert.Equal(t, fantasy.MessageRoleTool, msg.Role)
 
 	toolResult, ok := msg.Content[0].(fantasy.ToolResultPart)
 	require.True(t, ok)
@@ -1870,4 +1881,148 @@ func TestOpenAICompatProvider_Implements_ModelLLM(t *testing.T) {
 
 	adapter := NewAdapter(languageModel)
 	assert.Implements(t, (*model.LLM)(nil), adapter)
+}
+
+func TestLlmRequestToFantasyCall_ToolResultsGetToolRole(t *testing.T) {
+	req := &model.LLMRequest{
+		Model: "test-model",
+		Contents: []*genai.Content{
+			{
+				Role: "user",
+				Parts: []*genai.Part{
+					{Text: "What's the weather in NYC?"},
+				},
+			},
+			{
+				Role: "model",
+				Parts: []*genai.Part{
+					{Text: "I'll get the weather for you."},
+					{FunctionCall: &genai.FunctionCall{
+						ID:   "call-123",
+						Name: "get_weather",
+						Args: map[string]any{"city": "NYC"},
+					}},
+				},
+			},
+			{
+				Role: "user",
+				Parts: []*genai.Part{
+					{FunctionResponse: &genai.FunctionResponse{
+						ID:   "call-123",
+						Name: "get_weather",
+						Response: map[string]any{
+							"temperature": 72,
+							"conditions":  "sunny",
+						},
+					}},
+				},
+			},
+		},
+	}
+
+	call, err := llmRequestToFantasyCall(req)
+	require.NoError(t, err)
+
+	require.Len(t, call.Prompt, 3, "Expected 3 messages in prompt")
+
+	assert.Equal(t, fantasy.MessageRoleUser, call.Prompt[0].Role,
+		"First message should be user role")
+
+	assert.Equal(t, fantasy.MessageRoleAssistant, call.Prompt[1].Role,
+		"Second message should be assistant role")
+
+	assert.Equal(t, fantasy.MessageRoleTool, call.Prompt[2].Role,
+		"Tool results should have MessageRoleTool, not MessageRoleUser")
+
+	require.Len(t, call.Prompt[2].Content, 1, "Expected 1 content part in tool result")
+	toolResult, ok := call.Prompt[2].Content[0].(fantasy.ToolResultPart)
+	require.True(t, ok, "Expected ToolResultPart")
+	assert.Equal(t, "call-123", toolResult.ToolCallID)
+
+	output, ok := toolResult.Output.(fantasy.ToolResultOutputContentText)
+	require.True(t, ok, "Expected ToolResultOutputContentText")
+	assert.Contains(t, output.Text, "temperature")
+	assert.Contains(t, output.Text, "72")
+}
+
+func TestGenaiContentToFantasyMessage_MixedTextAndFunctionResponse(t *testing.T) {
+	content := &genai.Content{
+		Parts: []*genai.Part{
+			{Text: "Here's the result:"},
+			{FunctionResponse: &genai.FunctionResponse{
+				ID:   "call-123",
+				Name: "get_data",
+				Response: map[string]any{
+					"value": 42,
+				},
+			}},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content)
+	require.NoError(t, err)
+	assert.Equal(t, fantasy.MessageRoleTool, msg.Role, "Mixed content with FunctionResponse should get MessageRoleTool")
+	require.Len(t, msg.Content, 2, "Expected 2 content parts")
+
+	textPart, ok := msg.Content[0].(fantasy.TextPart)
+	require.True(t, ok)
+	assert.Equal(t, "Here's the result:", textPart.Text)
+
+	toolResult, ok := msg.Content[1].(fantasy.ToolResultPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-123", toolResult.ToolCallID)
+}
+
+func TestGenaiContentToFantasyMessage_MultipleFunctionResponses(t *testing.T) {
+	content := &genai.Content{
+		Parts: []*genai.Part{
+			{FunctionResponse: &genai.FunctionResponse{
+				ID:   "call-1",
+				Name: "func1",
+				Response: map[string]any{
+					"result": "first",
+				},
+			}},
+			{FunctionResponse: &genai.FunctionResponse{
+				ID:   "call-2",
+				Name: "func2",
+				Response: map[string]any{
+					"result": "second",
+				},
+			}},
+		},
+	}
+
+	msg, err := genaiContentToFantasyMessage(content)
+	require.NoError(t, err)
+	assert.Equal(t, fantasy.MessageRoleTool, msg.Role, "Multiple FunctionResponses should get MessageRoleTool")
+	require.Len(t, msg.Content, 2, "Expected 2 tool result parts")
+
+	toolResult1, ok := msg.Content[0].(fantasy.ToolResultPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-1", toolResult1.ToolCallID)
+
+	toolResult2, ok := msg.Content[1].(fantasy.ToolResultPart)
+	require.True(t, ok)
+	assert.Equal(t, "call-2", toolResult2.ToolCallID)
+}
+
+func TestGenaiContentToFantasyMessage_FunctionCallAndResponseMixed(t *testing.T) {
+	content := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{FunctionCall: &genai.FunctionCall{
+				ID:   "call-1",
+				Name: "func1",
+			}},
+			{FunctionResponse: &genai.FunctionResponse{
+				ID:   "call-2",
+				Name: "func2",
+			}},
+		},
+	}
+
+	_, err := genaiContentToFantasyMessage(content)
+	require.Error(t, err, "Content with both FunctionCall and FunctionResponse should error")
+	assert.Contains(t, err.Error(), "cannot contain both FunctionCall and FunctionResponse")
 }

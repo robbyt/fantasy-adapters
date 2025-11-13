@@ -179,7 +179,7 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 		}
 
 		if req.Config.SystemInstruction != nil {
-			systemMsg, err := genaiContentToFantasyMessage(req.Config.SystemInstruction, fantasy.MessageRoleSystem)
+			systemMsg, err := genaiSystemInstructionToFantasyMessage(req.Config.SystemInstruction)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("system instruction: %w", err))
 			} else {
@@ -260,12 +260,7 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 	}
 
 	for _, content := range req.Contents {
-		role := fantasy.MessageRoleUser
-		if content.Role == RoleModel {
-			role = fantasy.MessageRoleAssistant
-		}
-
-		msg, err := genaiContentToFantasyMessage(content, role)
+		msg, err := genaiContentToFantasyMessage(content)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -278,6 +273,11 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 
 // genaiContentToFantasyMessage converts genai.Content to fantasy.Message.
 //
+// Determines the message role based on content:
+//   - Content with FunctionResponse parts -> MessageRoleTool
+//   - Content with Role="model" -> MessageRoleAssistant
+//   - Otherwise -> MessageRoleUser
+//
 // Maps genai.Part types to fantasy message parts:
 //   - Part.Text with Thought:true -> ReasoningPart
 //   - Part.Text -> TextPart
@@ -289,10 +289,35 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 //   - FileData (URI references)
 //   - ExecutableCode, CodeExecutionResult
 //   - VideoMetadata
-func genaiContentToFantasyMessage(content *genai.Content, role fantasy.MessageRole) (fantasy.Message, error) {
+//
+// Returns error if content contains both FunctionCall and FunctionResponse parts.
+func genaiContentToFantasyMessage(content *genai.Content) (fantasy.Message, error) {
 	var msg fantasy.Message
-	msg.Role = role
 	var errs []error
+
+	// Determine role based on content
+	hasFunctionCall := false
+	hasFunctionResponse := false
+	for _, part := range content.Parts {
+		if part.FunctionCall != nil {
+			hasFunctionCall = true
+		}
+		if part.FunctionResponse != nil {
+			hasFunctionResponse = true
+		}
+	}
+
+	if hasFunctionCall && hasFunctionResponse {
+		return msg, errors.New("content cannot contain both FunctionCall and FunctionResponse parts")
+	}
+
+	if hasFunctionResponse {
+		msg.Role = fantasy.MessageRoleTool
+	} else if content.Role == RoleModel {
+		msg.Role = fantasy.MessageRoleAssistant
+	} else {
+		msg.Role = fantasy.MessageRoleUser
+	}
 
 	for _, part := range content.Parts {
 		if part.Text != "" && part.Thought {
@@ -343,6 +368,18 @@ func genaiContentToFantasyMessage(content *genai.Content, role fantasy.MessageRo
 	}
 
 	return msg, errors.Join(errs...)
+}
+
+// genaiSystemInstructionToFantasyMessage converts a genai.Content to a fantasy.Message
+// with MessageRoleSystem role, regardless of the content's role field.
+// This is used specifically for system instructions.
+func genaiSystemInstructionToFantasyMessage(content *genai.Content) (fantasy.Message, error) {
+	msg, err := genaiContentToFantasyMessage(content)
+	if err != nil {
+		return msg, err
+	}
+	msg.Role = fantasy.MessageRoleSystem
+	return msg, nil
 }
 
 func schemaToMap(schema *genai.Schema) (map[string]any, error) {
