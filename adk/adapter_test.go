@@ -1393,9 +1393,9 @@ func TestGenaiToolsToFantasyTools_ParametersJsonSchemaAsBytes(t *testing.T) {
 	assert.Equal(t, "number", lon["type"])
 	assert.Equal(t, "Longitude coordinate", lon["description"])
 
-	required, ok := ft.InputSchema["required"].([]any)
+	required, ok := ft.InputSchema["required"].([]string)
 	require.True(t, ok)
-	assert.Len(t, required, 2)
+	assert.Equal(t, []string{"latitude", "longitude"}, required)
 }
 
 func TestGenaiToolsToFantasyTools_BothParametersAndJsonSchema(t *testing.T) {
@@ -1439,6 +1439,184 @@ func TestGenaiToolsToFantasyTools_BothParametersAndJsonSchema(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, props, "param1", "Should use Parameters field when both are present")
 	assert.NotContains(t, props, "param2", "Should prefer Parameters over ParametersJsonSchema")
+}
+
+func TestGenaiToolsToFantasyTools_RequiredFieldNormalization(t *testing.T) {
+	// Test that []interface{} from JSON unmarshal is normalized to []string
+	// This simulates what happens when MCP tools use ParametersJsonSchema
+	schemaWithRequired := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"city_name": map[string]any{
+				"type":        "string",
+				"description": "US city name",
+			},
+			"unit": map[string]any{
+				"type":        "string",
+				"description": "Temperature unit",
+				"enum":        []interface{}{"celsius", "fahrenheit"},
+			},
+		},
+		"required": []interface{}{"city_name"},
+	}
+
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:                 "geocode_city",
+					Description:          "Convert city name to coordinates",
+					ParametersJsonSchema: schemaWithRequired,
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+
+	// Verify required field is normalized to []string
+	required, ok := ft.InputSchema["required"].([]string)
+	require.True(t, ok, "required field should be []string after normalization")
+	assert.Equal(t, []string{"city_name"}, required)
+
+	// Verify enum field is also normalized to []string
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	unit, ok := props["unit"].(map[string]any)
+	require.True(t, ok)
+	enum, ok := unit["enum"].([]string)
+	require.True(t, ok, "enum field should be []string after normalization")
+	assert.Equal(t, []string{"celsius", "fahrenheit"}, enum)
+}
+
+func TestGenaiToolsToFantasyTools_PropertyOrderingNormalization(t *testing.T) {
+	// Test that propertyOrdering field is normalized from []interface{} to []string
+	schemaWithPropertyOrdering := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{
+				"type":        "string",
+				"description": "User name",
+			},
+			"email": map[string]any{
+				"type":        "string",
+				"description": "Email address",
+			},
+			"age": map[string]any{
+				"type":        "integer",
+				"description": "User age",
+			},
+		},
+		"propertyOrdering": []interface{}{"name", "email", "age"},
+	}
+
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:                 "create_user",
+					Description:          "Create a new user",
+					ParametersJsonSchema: schemaWithPropertyOrdering,
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+
+	// Verify propertyOrdering field is normalized to []string
+	propOrder, ok := ft.InputSchema["propertyOrdering"].([]string)
+	require.True(t, ok, "propertyOrdering field should be []string after normalization")
+	assert.Equal(t, []string{"name", "email", "age"}, propOrder)
+}
+
+func TestGenaiToolsToFantasyTools_AnyOfRecursiveNormalization(t *testing.T) {
+	// Test that schemas within anyOf are recursively normalized
+	schemaWithAnyOf := map[string]any{
+		"type": "object",
+		"anyOf": []interface{}{
+			map[string]any{
+				"properties": map[string]any{
+					"text": map[string]any{
+						"type":        "string",
+						"description": "Text content",
+					},
+				},
+				"required": []interface{}{"text"},
+			},
+			map[string]any{
+				"properties": map[string]any{
+					"number": map[string]any{
+						"type":        "number",
+						"description": "Numeric content",
+					},
+					"unit": map[string]any{
+						"type":        "string",
+						"description": "Unit of measurement",
+						"enum":        []interface{}{"meters", "feet", "inches"},
+					},
+				},
+				"required": []interface{}{"number", "unit"},
+			},
+		},
+	}
+
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:                 "process_input",
+					Description:          "Process text or numeric input",
+					ParametersJsonSchema: schemaWithAnyOf,
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+
+	// Verify anyOf array exists
+	anyOf, ok := ft.InputSchema["anyOf"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, anyOf, 2)
+
+	// Verify first schema in anyOf has normalized required field
+	schema1, ok := anyOf[0].(map[string]any)
+	require.True(t, ok)
+	required1, ok := schema1["required"].([]string)
+	require.True(t, ok, "required field in anyOf[0] should be []string after normalization")
+	assert.Equal(t, []string{"text"}, required1)
+
+	// Verify second schema in anyOf has normalized required and enum fields
+	schema2, ok := anyOf[1].(map[string]any)
+	require.True(t, ok)
+	required2, ok := schema2["required"].([]string)
+	require.True(t, ok, "required field in anyOf[1] should be []string after normalization")
+	assert.Equal(t, []string{"number", "unit"}, required2)
+
+	// Verify enum in nested property is also normalized
+	props2, ok := schema2["properties"].(map[string]any)
+	require.True(t, ok)
+	unit, ok := props2["unit"].(map[string]any)
+	require.True(t, ok)
+	enum, ok := unit["enum"].([]string)
+	require.True(t, ok, "enum field in anyOf[1].properties.unit should be []string after normalization")
+	assert.Equal(t, []string{"meters", "feet", "inches"}, enum)
 }
 
 func TestSchemaToMap_NilSchema(t *testing.T) {

@@ -500,6 +500,74 @@ func schemaToMap(schema *genai.Schema) (map[string]any, error) {
 	return result, nil
 }
 
+// normalizeSchemaArrays converts []interface{} to []string for schema fields
+// that must be string arrays per JSON Schema spec (required, enum, propertyOrdering).
+// Also recursively normalizes nested schemas in properties, items, and anyOf.
+// This handles type mismatches from JSON marshal/unmarshal round-trips.
+func normalizeSchemaArrays(schema map[string]any) {
+	// Normalize 'required' field
+	if req, ok := schema["required"]; ok && req != nil {
+		if reqSlice, ok := req.([]interface{}); ok {
+			strSlice := make([]string, 0, len(reqSlice))
+			for _, item := range reqSlice {
+				if str, ok := item.(string); ok {
+					strSlice = append(strSlice, str)
+				}
+			}
+			schema["required"] = strSlice
+		}
+	}
+
+	// Normalize 'enum' field
+	if enum, ok := schema["enum"]; ok && enum != nil {
+		if enumSlice, ok := enum.([]interface{}); ok {
+			strSlice := make([]string, 0, len(enumSlice))
+			for _, item := range enumSlice {
+				if str, ok := item.(string); ok {
+					strSlice = append(strSlice, str)
+				}
+			}
+			schema["enum"] = strSlice
+		}
+	}
+
+	// Normalize 'propertyOrdering' field
+	if propOrder, ok := schema["propertyOrdering"]; ok && propOrder != nil {
+		if propOrderSlice, ok := propOrder.([]interface{}); ok {
+			strSlice := make([]string, 0, len(propOrderSlice))
+			for _, item := range propOrderSlice {
+				if str, ok := item.(string); ok {
+					strSlice = append(strSlice, str)
+				}
+			}
+			schema["propertyOrdering"] = strSlice
+		}
+	}
+
+	// Recursively normalize nested properties
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for _, prop := range props {
+			if propSchema, ok := prop.(map[string]any); ok {
+				normalizeSchemaArrays(propSchema)
+			}
+		}
+	}
+
+	// Normalize array items schema
+	if items, ok := schema["items"].(map[string]any); ok {
+		normalizeSchemaArrays(items)
+	}
+
+	// Recursively normalize anyOf schemas
+	if anyOf, ok := schema["anyOf"].([]interface{}); ok {
+		for _, item := range anyOf {
+			if subSchema, ok := item.(map[string]any); ok {
+				normalizeSchemaArrays(subSchema)
+			}
+		}
+	}
+}
+
 func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 	var fantasyTools []fantasy.Tool
 	var errs []error
@@ -531,6 +599,8 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 							errs = append(errs, fmt.Errorf("failed to unmarshal ParametersJsonSchema for function %q: %w", fn.Name, err))
 						}
 					}
+					// Normalize array fields to ensure []string type for strict API compatibility
+					normalizeSchemaArrays(params)
 				}
 				fantasyTools = append(fantasyTools, fantasy.FunctionTool{
 					Name:        fn.Name,
