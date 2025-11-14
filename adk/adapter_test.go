@@ -2432,3 +2432,271 @@ func TestFantasyStreamToLLM_CompleteToolCallFlow(t *testing.T) {
 	t.Logf("  - Tool calls: %d", len(toolCalls))
 	t.Logf("  - Final response present: %v", finalResponse != nil)
 }
+
+func TestFantasyStreamToLLM_ToolCallTimingDiagnostic(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextStart,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			Delta: "I'll call a tool.",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextEnd,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-123",
+			ToolCallName: "test_tool",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-123",
+			ToolCallInput: `{"arg":"val`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-123",
+			ToolCallInput: `ue"}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-123",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	type event struct {
+		index        int
+		hasText      bool
+		textContent  string
+		hasToolCall  bool
+		toolCallName string
+		partial      bool
+		turnComplete bool
+	}
+
+	var events []event
+	eventIndex := 0
+
+	for resp, err := range iter {
+		require.NoError(t, err)
+
+		ev := event{
+			index:        eventIndex,
+			partial:      resp.Partial,
+			turnComplete: resp.TurnComplete,
+		}
+
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.Text != "" {
+					ev.hasText = true
+					ev.textContent = part.Text
+				}
+				if part.FunctionCall != nil {
+					ev.hasToolCall = true
+					ev.toolCallName = part.FunctionCall.Name
+				}
+			}
+		}
+
+		events = append(events, ev)
+		eventIndex++
+	}
+
+	t.Logf("Tool call timing diagnostic results:")
+	t.Logf("Total events yielded: %d", len(events))
+	for _, ev := range events {
+		t.Logf("  Event[%d]: Text=%v (%q), ToolCall=%v (%q), Partial=%v, TurnComplete=%v",
+			ev.index, ev.hasText, ev.textContent, ev.hasToolCall, ev.toolCallName, ev.partial, ev.turnComplete)
+	}
+
+	require.GreaterOrEqual(t, len(events), 2, "Should have at least 2 events (text delta + final)")
+
+	var foundToolBeforeTurnComplete bool
+	var foundToolInFinal bool
+
+	for _, ev := range events {
+		if ev.hasToolCall {
+			if !ev.turnComplete {
+				foundToolBeforeTurnComplete = true
+				t.Logf("Found tool call BEFORE TurnComplete at event %d (Partial=%v, TurnComplete=%v)",
+					ev.index, ev.partial, ev.turnComplete)
+			}
+			if ev.turnComplete {
+				foundToolInFinal = true
+				t.Logf("Found tool call in FINAL response at event %d", ev.index)
+			}
+		}
+	}
+
+	t.Logf("")
+	t.Logf("Summary:")
+	t.Logf("  Tool call with TurnComplete=false (correct): %v", foundToolBeforeTurnComplete)
+	t.Logf("  Tool call with TurnComplete=true (incorrect): %v", foundToolInFinal)
+
+	require.True(t, foundToolBeforeTurnComplete,
+		"Tool call MUST be yielded with TurnComplete=false so ADK can execute it")
+	assert.False(t, foundToolInFinal,
+		"Tool call should NOT be in TurnComplete=true response (should be filtered out)")
+}
+
+func TestFantasyStreamToLLM_ToolCallsWithoutTurnComplete(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-456",
+			ToolCallName: "immediate_tool",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-456",
+			ToolCallInput: `{"param":"value"}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-456",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var responses []*model.LLMResponse
+	for resp, err := range iter {
+		require.NoError(t, err)
+		responses = append(responses, resp)
+	}
+
+	require.GreaterOrEqual(t, len(responses), 1, "Should have at least final response")
+
+	var toolCallResponse *model.LLMResponse
+	for _, resp := range responses {
+		if resp.Content != nil {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil {
+					toolCallResponse = resp
+					t.Logf("Found tool call in response: Partial=%v, TurnComplete=%v",
+						resp.Partial, resp.TurnComplete)
+					t.Logf("  Tool: %s", part.FunctionCall.Name)
+					t.Logf("  Args: %+v", part.FunctionCall.Args)
+					break
+				}
+			}
+		}
+	}
+
+	require.NotNil(t, toolCallResponse, "Tool call must be in some response")
+
+	assert.False(t, toolCallResponse.TurnComplete,
+		"Tool call MUST have TurnComplete=false so ADK can execute it before ending the turn")
+
+	assert.Contains(t, toolCallResponse.Content.Parts[0].FunctionCall.Args, "param",
+		"Tool should have parameters")
+	assert.Equal(t, "value", toolCallResponse.Content.Parts[0].FunctionCall.Args["param"])
+}
+
+func TestFantasyStreamToLLM_ToolCallRequiredFields(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-789",
+			ToolCallName: "check_fields",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-789",
+			ToolCallInput: `{"field1":"val1","field2":42}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-789",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var toolCall *genai.FunctionCall
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil {
+					toolCall = part.FunctionCall
+					break
+				}
+			}
+		}
+	}
+
+	require.NotNil(t, toolCall, "Tool call must exist")
+
+	assert.NotEmpty(t, toolCall.ID, "Tool call must have ID")
+	assert.Equal(t, "call-789", toolCall.ID, "Tool call ID must match")
+
+	assert.NotEmpty(t, toolCall.Name, "Tool call must have Name")
+	assert.Equal(t, "check_fields", toolCall.Name, "Tool call Name must match")
+
+	require.NotNil(t, toolCall.Args, "Tool call must have Args")
+	require.IsType(t, map[string]any{}, toolCall.Args, "Args must be map[string]any")
+
+	assert.Contains(t, toolCall.Args, "field1", "Args must contain field1")
+	assert.Contains(t, toolCall.Args, "field2", "Args must contain field2")
+	assert.Equal(t, "val1", toolCall.Args["field1"])
+	assert.InDelta(t, 42.0, toolCall.Args["field2"], 0.001)
+
+	t.Logf("Tool call structure verification:")
+	t.Logf("  ID: %s ✓", toolCall.ID)
+	t.Logf("  Name: %s ✓", toolCall.Name)
+	t.Logf("  Args type: %T ✓", toolCall.Args)
+	t.Logf("  Args content: %+v ✓", toolCall.Args)
+}

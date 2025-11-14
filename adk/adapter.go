@@ -619,6 +619,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 		var currentPart *genai.Part
 		var partIndex int
 		toolInputAccumulator := make(map[string]*strings.Builder)
+		yieldedToolIDs := make(map[string]bool)
 
 		for part := range stream {
 			switch part.Type {
@@ -731,6 +732,31 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 							}
 						}
 					}
+
+					toolCallContent := &genai.Content{
+						Role:  RoleModel,
+						Parts: []*genai.Part{currentPart},
+					}
+					if !yield(&model.LLMResponse{
+						Content:           toolCallContent,
+						CitationMetadata:  nil,
+						GroundingMetadata: nil,
+						UsageMetadata:     nil,
+						CustomMetadata:    nil,
+						LogprobsResult:    nil,
+						Partial:           false,
+						TurnComplete:      false,
+						Interrupted:       false,
+						ErrorCode:         "",
+						ErrorMessage:      "",
+						FinishReason:      "",
+						AvgLogprobs:       0,
+					}, nil) {
+						return
+					}
+
+					yieldedToolIDs[part.ID] = true
+
 					delete(toolInputAccumulator, part.ID)
 				}
 				currentPart = nil
@@ -753,8 +779,26 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 				partIndex++
 
 			case fantasy.StreamPartTypeFinish:
+				finalContent := currentContent
+				if currentContent != nil && len(yieldedToolIDs) > 0 {
+					filteredParts := make([]*genai.Part, 0)
+					for _, part := range currentContent.Parts {
+						if part.FunctionCall != nil {
+							if yieldedToolIDs[part.FunctionCall.ID] {
+								continue
+							}
+						}
+						filteredParts = append(filteredParts, part)
+					}
+					if len(filteredParts) > 0 {
+						finalContent = &genai.Content{Role: RoleModel, Parts: filteredParts}
+					} else {
+						finalContent = nil
+					}
+				}
+
 				if !yield(&model.LLMResponse{
-					Content:           currentContent,
+					Content:           finalContent,
 					CitationMetadata:  nil,
 					GroundingMetadata: nil,
 					UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
