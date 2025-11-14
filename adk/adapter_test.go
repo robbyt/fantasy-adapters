@@ -625,6 +625,93 @@ func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
 	}
 }
 
+func TestFantasyStreamToLLM_ReasoningDeltasAreYieldedAsThoughts(t *testing.T) {
+	stream := newStreamBuilder().
+		addReasoningStart("0").
+		addReasoningDelta("0", "Let me ").
+		addReasoningDelta("0", "think about ").
+		addReasoningDelta("0", "this...").
+		addReasoningEnd("0").
+		addTextStart("1").
+		addTextDelta("1", "Here is ").
+		addTextDelta("1", "my answer.").
+		addTextEnd("1").
+		addFinish(fantasy.FinishReasonStop, fantasy.Usage{}).
+		build()
+
+	iter := fantasyStreamToLLM(stream)
+
+	var responses []*model.LLMResponse
+	var reasoningResponses []*model.LLMResponse
+	var textResponses []*model.LLMResponse
+	var finalResponse *model.LLMResponse
+
+	for resp, err := range iter {
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		responses = append(responses, resp)
+
+		if resp.TurnComplete {
+			finalResponse = resp
+			break
+		}
+
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			if resp.Content.Parts[0].Thought {
+				reasoningResponses = append(reasoningResponses, resp)
+			} else if resp.Content.Parts[0].Text != "" {
+				textResponses = append(textResponses, resp)
+			}
+		}
+	}
+
+	// Verify reasoning deltas were yielded with Thought: true
+	require.Len(t, reasoningResponses, 3, "Should yield 3 reasoning delta responses")
+	for i, resp := range reasoningResponses {
+		require.NotNil(t, resp.Content, "Reasoning response %d should have content", i)
+		require.Len(t, resp.Content.Parts, 1, "Reasoning response %d should have 1 part", i)
+		assert.True(t, resp.Content.Parts[0].Thought, "Reasoning response %d should have Thought=true", i)
+		assert.True(t, resp.Partial, "Reasoning response %d should be partial", i)
+		assert.False(t, resp.TurnComplete, "Reasoning response %d should not be turn complete", i)
+	}
+
+	// Verify the actual reasoning deltas content
+	assert.Equal(t, "Let me ", reasoningResponses[0].Content.Parts[0].Text)
+	assert.Equal(t, "think about ", reasoningResponses[1].Content.Parts[0].Text)
+	assert.Equal(t, "this...", reasoningResponses[2].Content.Parts[0].Text)
+
+	// Verify text deltas were yielded without Thought flag
+	require.Len(t, textResponses, 2, "Should yield 2 text delta responses")
+	for i, resp := range textResponses {
+		require.NotNil(t, resp.Content, "Text response %d should have content", i)
+		require.Len(t, resp.Content.Parts, 1, "Text response %d should have 1 part", i)
+		assert.False(t, resp.Content.Parts[0].Thought, "Text response %d should have Thought=false", i)
+		assert.True(t, resp.Partial, "Text response %d should be partial", i)
+		assert.False(t, resp.TurnComplete, "Text response %d should not be turn complete", i)
+	}
+
+	// Verify the actual text deltas content
+	assert.Equal(t, "Here is ", textResponses[0].Content.Parts[0].Text)
+	assert.Equal(t, "my answer.", textResponses[1].Content.Parts[0].Text)
+
+	// Verify final response includes both reasoning and text content
+	require.NotNil(t, finalResponse, "Should have final response")
+	require.NotNil(t, finalResponse.Content, "Final response should have content")
+	require.Len(t, finalResponse.Content.Parts, 2, "Final response should have 2 parts (reasoning + text)")
+
+	// Verify first part is reasoning with Thought=true
+	assert.True(t, finalResponse.Content.Parts[0].Thought, "First part should be reasoning with Thought=true")
+	assert.Equal(t, "Let me think about this...", finalResponse.Content.Parts[0].Text, "Reasoning should be accumulated")
+
+	// Verify second part is text without Thought flag
+	assert.False(t, finalResponse.Content.Parts[1].Thought, "Second part should be text with Thought=false")
+	assert.Equal(t, "Here is my answer.", finalResponse.Content.Parts[1].Text, "Text should be accumulated")
+
+	// Verify final response is marked as turn complete
+	assert.True(t, finalResponse.TurnComplete, "Final response should be turn complete")
+	assert.False(t, finalResponse.Partial, "Final response should not be partial")
+}
+
 func TestFantasyStreamToLLM_WithError(t *testing.T) {
 	testErr := errors.New("test error")
 	stream := newStreamBuilder().

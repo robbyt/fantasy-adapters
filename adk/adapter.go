@@ -858,6 +858,29 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 			case fantasy.StreamPartTypeReasoningDelta:
 				if currentPart != nil {
 					currentPart.Text += part.Delta
+					deltaContent := &genai.Content{
+						Role: RoleModel,
+						Parts: []*genai.Part{
+							{Text: part.Delta, Thought: true},
+						},
+					}
+					if !yield(&model.LLMResponse{
+						Content:           deltaContent,
+						CitationMetadata:  nil,
+						GroundingMetadata: nil,
+						UsageMetadata:     nil,
+						CustomMetadata:    nil,
+						LogprobsResult:    nil,
+						Partial:           true,
+						TurnComplete:      false,
+						Interrupted:       false,
+						ErrorCode:         "",
+						ErrorMessage:      "",
+						FinishReason:      "",
+						AvgLogprobs:       0,
+					}, nil) {
+						return
+					}
 				}
 
 			case fantasy.StreamPartTypeReasoningEnd:
