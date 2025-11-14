@@ -657,8 +657,14 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 			case fantasy.StreamPartTypeTextDelta:
 				if currentPart != nil {
 					currentPart.Text += part.Delta
+					deltaContent := &genai.Content{
+						Role: RoleModel,
+						Parts: []*genai.Part{
+							{Text: part.Delta},
+						},
+					}
 					if !yield(&model.LLMResponse{
-						Content:           currentContent,
+						Content:           deltaContent,
 						CitationMetadata:  nil,
 						GroundingMetadata: nil,
 						UsageMetadata:     nil,
