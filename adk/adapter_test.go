@@ -1128,7 +1128,120 @@ func TestGenaiToolsToFantasyTools_WithParameters(t *testing.T) {
 	assert.Equal(t, "test-function", ft.Name)
 	assert.Equal(t, "test description", ft.Description)
 	require.NotNil(t, ft.InputSchema)
-	assert.Equal(t, "OBJECT", ft.InputSchema["type"])
+	assert.Equal(t, "object", ft.InputSchema["type"])
+}
+
+func TestGenaiToolsToFantasyTools_ParameterPropertiesPreserved(t *testing.T) {
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:        "get_weather",
+					Description: "Get weather for a location",
+					Parameters: &genai.Schema{
+						Type: "OBJECT",
+						Properties: map[string]*genai.Schema{
+							"location": {
+								Type:        "STRING",
+								Description: "City name",
+							},
+							"units": {
+								Type:        "STRING",
+								Description: "Temperature units",
+								Enum:        []string{"celsius", "fahrenheit"},
+							},
+						},
+						Required: []string{"location"},
+					},
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+	assert.Equal(t, "get_weather", ft.Name)
+	assert.Equal(t, "Get weather for a location", ft.Description)
+
+	require.NotNil(t, ft.InputSchema)
+	assert.Equal(t, "object", ft.InputSchema["type"])
+
+	assert.Contains(t, ft.InputSchema, "properties", "InputSchema should contain properties")
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok, "properties should be a map")
+
+	assert.Contains(t, props, "location", "Should have location property")
+	assert.Contains(t, props, "units", "Should have units property")
+
+	location, ok := props["location"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "string", location["type"])
+	assert.Equal(t, "City name", location["description"])
+
+	units, ok := props["units"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "string", units["type"])
+	assert.Equal(t, "Temperature units", units["description"])
+	assert.Equal(t, []string{"celsius", "fahrenheit"}, units["enum"])
+
+	assert.Contains(t, ft.InputSchema, "required", "InputSchema should contain required fields")
+	assert.Equal(t, []string{"location"}, ft.InputSchema["required"])
+}
+
+func TestGenaiToolsToFantasyTools_SystemInformationTool(t *testing.T) {
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:        "system_information",
+					Description: "Get system information about the host including OS and architecture",
+					Parameters: &genai.Schema{
+						Type: "OBJECT",
+						Properties: map[string]*genai.Schema{
+							"detailed": {
+								Type:        "BOOLEAN",
+								Description: "Whether to include detailed information",
+							},
+						},
+						Required: []string{"detailed"},
+					},
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+	assert.Equal(t, "system_information", ft.Name)
+
+	require.NotNil(t, ft.InputSchema)
+
+	jsonBytes, err := json.MarshalIndent(ft.InputSchema, "", "  ")
+	require.NoError(t, err)
+	t.Logf("InputSchema JSON:\n%s", string(jsonBytes))
+
+	assert.Equal(t, "object", ft.InputSchema["type"])
+	assert.Contains(t, ft.InputSchema, "properties")
+	assert.Contains(t, ft.InputSchema, "required")
+
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok, "properties should be a map")
+	assert.Contains(t, props, "detailed")
+
+	detailed, ok := props["detailed"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "boolean", detailed["type"])
+	assert.Equal(t, "Whether to include detailed information", detailed["description"])
+
+	assert.Equal(t, []string{"detailed"}, ft.InputSchema["required"])
 }
 
 func TestSchemaToMap_NilSchema(t *testing.T) {
@@ -1146,22 +1259,22 @@ func TestSchemaToMap_BasicTypes(t *testing.T) {
 		{
 			name:     "string type",
 			schema:   &genai.Schema{Type: "STRING", Description: "A string value"},
-			expected: map[string]any{"type": "STRING", "description": "A string value"},
+			expected: map[string]any{"type": "string", "description": "A string value"},
 		},
 		{
 			name:     "number type with format",
 			schema:   &genai.Schema{Type: "NUMBER", Format: "float"},
-			expected: map[string]any{"type": "NUMBER", "format": "float"},
+			expected: map[string]any{"type": "number", "format": "float"},
 		},
 		{
 			name:     "boolean type",
 			schema:   &genai.Schema{Type: "BOOLEAN"},
-			expected: map[string]any{"type": "BOOLEAN"},
+			expected: map[string]any{"type": "boolean"},
 		},
 		{
 			name:     "integer with min/max",
 			schema:   &genai.Schema{Type: "INTEGER", Minimum: genai.Ptr(1.0), Maximum: genai.Ptr(100.0)},
-			expected: map[string]any{"type": "INTEGER", "minimum": 1.0, "maximum": 100.0},
+			expected: map[string]any{"type": "integer", "minimum": 1.0, "maximum": 100.0},
 		},
 	}
 
@@ -1187,7 +1300,7 @@ func TestSchemaToMap_ObjectWithProperties(t *testing.T) {
 
 	result, err := schemaToMap(schema)
 	require.NoError(t, err)
-	assert.Equal(t, "OBJECT", result["type"])
+	assert.Equal(t, "object", result["type"])
 	assert.Equal(t, "A person object", result["description"])
 	assert.Contains(t, result, "properties")
 	assert.Contains(t, result, "required")
@@ -1210,12 +1323,12 @@ func TestSchemaToMap_ArrayWithItems(t *testing.T) {
 
 	result, err := schemaToMap(schema)
 	require.NoError(t, err)
-	assert.Equal(t, "ARRAY", result["type"])
+	assert.Equal(t, "array", result["type"])
 	assert.Contains(t, result, "items")
 
 	items, ok := result["items"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "STRING", items["type"])
+	assert.Equal(t, "string", items["type"])
 	assert.Equal(t, "String item", items["description"])
 }
 
@@ -1227,7 +1340,7 @@ func TestSchemaToMap_WithEnum(t *testing.T) {
 
 	result, err := schemaToMap(schema)
 	require.NoError(t, err)
-	assert.Equal(t, "STRING", result["type"])
+	assert.Equal(t, "string", result["type"])
 	assert.Equal(t, []string{"red", "green", "blue"}, result["enum"])
 }
 
@@ -1253,7 +1366,7 @@ func TestSchemaToMap_NestedObjects(t *testing.T) {
 
 	address, ok := props["address"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "OBJECT", address["type"])
+	assert.Equal(t, "object", address["type"])
 
 	addressProps, ok := address["properties"].(map[string]any)
 	require.True(t, ok)

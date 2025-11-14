@@ -390,7 +390,7 @@ func schemaToMap(schema *genai.Schema) (map[string]any, error) {
 	result := make(map[string]any)
 
 	if schema.Type != "" {
-		result["type"] = fmt.Sprintf("%v", schema.Type)
+		result["type"] = strings.ToLower(string(schema.Type))
 	}
 
 	if schema.Description != "" {
