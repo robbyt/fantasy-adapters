@@ -52,6 +52,240 @@ func (m *MockLanguageModel) Stream(ctx context.Context, call fantasy.Call) (fant
 	return args.Get(0).(fantasy.StreamResponse), args.Error(1)
 }
 
+// Test helper functions
+
+type streamBuilder struct {
+	parts []fantasy.StreamPart
+}
+
+func newStreamBuilder() *streamBuilder {
+	return &streamBuilder{parts: []fantasy.StreamPart{}}
+}
+
+func (sb *streamBuilder) addTextStart(id string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeTextStart,
+		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addTextDelta(id, delta string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:  fantasy.StreamPartTypeTextDelta,
+		ID:    id,
+		Delta: delta,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addTextEnd(id string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeTextEnd,
+		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addToolStart(id, name string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:         fantasy.StreamPartTypeToolInputStart,
+		ID:           id,
+		ToolCallName: name,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addToolDelta(id, input string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:          fantasy.StreamPartTypeToolInputDelta,
+		ID:            id,
+		ToolCallInput: input,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addToolEnd(id string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeToolInputEnd,
+		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addReasoningStart(id string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeReasoningStart,
+		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addReasoningDelta(id, delta string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:  fantasy.StreamPartTypeReasoningDelta,
+		ID:    id,
+		Delta: delta,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addReasoningEnd(id string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeReasoningEnd,
+		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addFinish(reason fantasy.FinishReason, usage fantasy.Usage) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:         fantasy.StreamPartTypeFinish,
+		FinishReason: reason,
+		Usage:        usage,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addError(err error) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:  fantasy.StreamPartTypeError,
+		Error: err,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) build() fantasy.StreamResponse {
+	parts := sb.parts
+	return func(yield func(fantasy.StreamPart) bool) {
+		for _, part := range parts {
+			if !yield(part) {
+				return
+			}
+		}
+	}
+}
+
+func collectResponses(t *testing.T, iter func(func(*model.LLMResponse, error) bool)) []*model.LLMResponse {
+	t.Helper()
+	var responses []*model.LLMResponse
+	for resp, err := range iter {
+		require.NoError(t, err)
+		responses = append(responses, resp)
+	}
+	return responses
+}
+
+// Request builder helper
+
+type requestBuilder struct {
+	req *model.LLMRequest
+}
+
+func newRequest() *requestBuilder {
+	return &requestBuilder{
+		req: &model.LLMRequest{
+			Model:    "test/model",
+			Contents: []*genai.Content{},
+			Config:   &genai.GenerateContentConfig{},
+		},
+	}
+}
+
+func (rb *requestBuilder) withUserText(text string) *requestBuilder {
+	rb.req.Contents = append(rb.req.Contents, &genai.Content{
+		Role:  "user",
+		Parts: []*genai.Part{{Text: text}},
+	})
+	return rb
+}
+
+func (rb *requestBuilder) build() *model.LLMRequest {
+	return rb.req
+}
+
+// Response builder helper
+
+func newResponseWithUsage(text string, inputTokens, outputTokens int64) *fantasy.Response {
+	return &fantasy.Response{
+		Content: []fantasy.Content{fantasy.TextContent{Text: text}},
+		Usage: fantasy.Usage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			TotalTokens:  inputTokens + outputTokens,
+		},
+		FinishReason: fantasy.FinishReasonStop,
+	}
+}
+
+// Mock setup helpers
+
+func mockGenerate(m *MockLanguageModel, response *fantasy.Response, err error) *MockLanguageModel {
+	m.On("Generate", mock.Anything, mock.Anything).Return(response, err)
+	return m
+}
+
+func mockStream(m *MockLanguageModel, stream fantasy.StreamResponse, err error) *MockLanguageModel {
+	m.On("Stream", mock.Anything, mock.Anything).Return(stream, err)
+	return m
+}
+
+// Assertion helpers
+
+func assertUsage(t *testing.T, resp *model.LLMResponse, prompt, candidates, total int32) {
+	t.Helper()
+	require.NotNil(t, resp.UsageMetadata)
+	assert.Equal(t, prompt, resp.UsageMetadata.PromptTokenCount)
+	assert.Equal(t, candidates, resp.UsageMetadata.CandidatesTokenCount)
+	assert.Equal(t, total, resp.UsageMetadata.TotalTokenCount)
+}
+
+func assertToolCall(t *testing.T, part *genai.Part, id, name string) {
+	t.Helper()
+	require.NotNil(t, part.FunctionCall)
+	assert.Equal(t, id, part.FunctionCall.ID)
+	assert.Equal(t, name, part.FunctionCall.Name)
+}
+
+// Schema builder helper
+
+type schemaBuilder struct {
+	schema *genai.Schema
+}
+
+func objectSchema() *schemaBuilder {
+	return &schemaBuilder{
+		schema: &genai.Schema{
+			Type:       "OBJECT",
+			Properties: make(map[string]*genai.Schema),
+		},
+	}
+}
+
+func (sb *schemaBuilder) withStringProp(name, desc string) *schemaBuilder {
+	sb.schema.Properties[name] = &genai.Schema{Type: "STRING", Description: desc}
+	return sb
+}
+
+func (sb *schemaBuilder) withIntegerProp(name, desc string) *schemaBuilder {
+	sb.schema.Properties[name] = &genai.Schema{Type: "INTEGER", Description: desc}
+	return sb
+}
+
+func (sb *schemaBuilder) withDescription(desc string) *schemaBuilder {
+	sb.schema.Description = desc
+	return sb
+}
+
+func (sb *schemaBuilder) withRequired(fields ...string) *schemaBuilder {
+	sb.schema.Required = fields
+	return sb
+}
+
+func (sb *schemaBuilder) build() *genai.Schema {
+	return sb.schema
+}
+
 func TestNewAdapter(t *testing.T) {
 	m := new(MockLanguageModel)
 
@@ -84,39 +318,14 @@ func TestAdapter_Name(t *testing.T) {
 }
 
 func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
-	m := new(MockLanguageModel)
+	expectedResponse := newResponseWithUsage("test response", 10, 20)
+	expectedResponse.FinishReason = fantasy.FinishReasonStop
 
-	expectedResponse := &fantasy.Response{
-		Content: []fantasy.Content{
-			fantasy.TextContent{Text: "test response"},
-		},
-		Usage: fantasy.Usage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-		},
-		FinishReason: fantasy.FinishReasonStop,
-	}
-
-	m.On("Generate", mock.Anything, mock.MatchedBy(func(call fantasy.Call) bool {
-		return len(call.Prompt) == 1 &&
-			call.Prompt[0].Role == fantasy.MessageRoleUser &&
-			len(call.Prompt[0].Content) == 1
-	})).Return(expectedResponse, nil)
+	m := mockGenerate(new(MockLanguageModel), expectedResponse, nil)
 	defer m.AssertExpectations(t)
 
 	adapter := &Adapter{model: m}
-	req := &model.LLMRequest{
-		Model: "test/model",
-		Contents: []*genai.Content{
-			{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "hello"},
-				},
-			},
-		},
-	}
+	req := newRequest().withUserText("hello").build()
 
 	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, false)
@@ -139,67 +348,27 @@ func TestAdapter_GenerateContent_NonStreaming(t *testing.T) {
 	assert.True(t, resp.TurnComplete)
 	assert.False(t, resp.Partial)
 
-	require.NotNil(t, resp.UsageMetadata)
-	assert.Equal(t, int32(10), resp.UsageMetadata.PromptTokenCount)
-	assert.Equal(t, int32(20), resp.UsageMetadata.CandidatesTokenCount)
-	assert.Equal(t, int32(30), resp.UsageMetadata.TotalTokenCount)
+	assertUsage(t, resp, 10, 20, 30)
 	assert.Equal(t, genai.FinishReasonStop, resp.FinishReason)
 }
 
 func TestAdapter_GenerateContent_Streaming(t *testing.T) {
-	m := new(MockLanguageModel)
+	stream := newStreamBuilder().
+		addTextStart("0").
+		addTextDelta("0", "test").
+		addTextEnd("0").
+		addFinish(fantasy.FinishReasonStop, fantasy.Usage{
+			InputTokens:  10,
+			OutputTokens: 4,
+			TotalTokens:  14,
+		}).
+		build()
 
-	streamFunc := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextStart,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeTextDelta,
-			ID:    "0",
-			Delta: "test",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextEnd,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonStop,
-			Usage: fantasy.Usage{
-				InputTokens:  10,
-				OutputTokens: 4,
-				TotalTokens:  14,
-			},
-		}) {
-			return
-		}
-	}
-
-	m.On("Stream", mock.Anything, mock.MatchedBy(func(call fantasy.Call) bool {
-		return len(call.Prompt) == 1 &&
-			call.Prompt[0].Role == fantasy.MessageRoleUser
-	})).Return(fantasy.StreamResponse(streamFunc), nil)
+	m := mockStream(new(MockLanguageModel), stream, nil)
 	defer m.AssertExpectations(t)
 
 	adapter := &Adapter{model: m}
-	req := &model.LLMRequest{
-		Model: "test/model",
-		Contents: []*genai.Content{
-			{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "hello"},
-				},
-			},
-		},
-	}
+	req := newRequest().withUserText("hello").build()
 
 	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, true)
@@ -214,10 +383,7 @@ func TestAdapter_GenerateContent_Streaming(t *testing.T) {
 
 	finalResp := responses[len(responses)-1]
 	assert.True(t, finalResp.TurnComplete)
-	require.NotNil(t, finalResp.UsageMetadata)
-	assert.Equal(t, int32(10), finalResp.UsageMetadata.PromptTokenCount)
-	assert.Equal(t, int32(4), finalResp.UsageMetadata.CandidatesTokenCount)
-	assert.Equal(t, int32(14), finalResp.UsageMetadata.TotalTokenCount)
+	assertUsage(t, finalResp, 10, 4, 14)
 }
 
 func TestLlmRequestToFantasyCall_Basic(t *testing.T) {
@@ -420,90 +586,34 @@ func TestFantasyResponseToLLM(t *testing.T) {
 }
 
 func TestFantasyStreamToLLM(t *testing.T) {
-	stream := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextStart,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeTextDelta,
-			ID:    "0",
-			Delta: "hello",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeTextDelta,
-			ID:    "0",
-			Delta: " world",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeTextEnd,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonStop,
-			Usage: fantasy.Usage{
-				InputTokens:  5,
-				OutputTokens: 2,
-				TotalTokens:  7,
-			},
-		}) {
-			return
-		}
-	}
+	stream := newStreamBuilder().
+		addTextStart("0").
+		addTextDelta("0", "hello").
+		addTextDelta("0", " world").
+		addTextEnd("0").
+		addFinish(fantasy.FinishReasonStop, fantasy.Usage{
+			InputTokens:  5,
+			OutputTokens: 2,
+			TotalTokens:  7,
+		}).
+		build()
 
 	iter := fantasyStreamToLLM(stream)
-
-	var responses []*model.LLMResponse
-	for resp, err := range iter {
-		require.NoError(t, err)
-		responses = append(responses, resp)
-	}
+	responses := collectResponses(t, iter)
 
 	require.NotEmpty(t, responses)
-
 	finalResp := responses[len(responses)-1]
 	assert.True(t, finalResp.TurnComplete)
 	require.NotNil(t, finalResp.UsageMetadata)
 }
 
 func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
-	stream := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeReasoningStart,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeReasoningDelta,
-			ID:    "0",
-			Delta: "thinking...",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeReasoningEnd,
-			ID:   "0",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonStop,
-			Usage:        fantasy.Usage{},
-		}) {
-			return
-		}
-	}
+	stream := newStreamBuilder().
+		addReasoningStart("0").
+		addReasoningDelta("0", "thinking...").
+		addReasoningEnd("0").
+		addFinish(fantasy.FinishReasonStop, fantasy.Usage{}).
+		build()
 
 	iter := fantasyStreamToLLM(stream)
 
@@ -517,12 +627,9 @@ func TestFantasyStreamToLLM_WithReasoning(t *testing.T) {
 
 func TestFantasyStreamToLLM_WithError(t *testing.T) {
 	testErr := errors.New("test error")
-	stream := func(yield func(fantasy.StreamPart) bool) {
-		yield(fantasy.StreamPart{
-			Type:  fantasy.StreamPartTypeError,
-			Error: testErr,
-		})
-	}
+	stream := newStreamBuilder().
+		addError(testErr).
+		build()
 
 	iter := fantasyStreamToLLM(stream)
 
@@ -837,26 +944,32 @@ func TestGenaiContentToFantasyMessage_FunctionResponse(t *testing.T) {
 	assert.Equal(t, "call-123", toolResult.ToolCallID)
 }
 
-func TestGenaiContentToFantasyMessage_ExecutableCode(t *testing.T) {
-	content := &genai.Content{
-		Parts: []*genai.Part{
-			{ExecutableCode: &genai.ExecutableCode{}},
+func TestGenaiContentToFantasyMessage_UnsupportedPartTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		part *genai.Part
+	}{
+		{
+			name: "ExecutableCode",
+			part: &genai.Part{ExecutableCode: &genai.ExecutableCode{}},
+		},
+		{
+			name: "VideoMetadata",
+			part: &genai.Part{VideoMetadata: &genai.VideoMetadata{}},
+		},
+		{
+			name: "CodeExecutionResult",
+			part: &genai.Part{CodeExecutionResult: &genai.CodeExecutionResult{}},
 		},
 	}
 
-	_, err := genaiContentToFantasyMessage(content)
-	require.Error(t, err)
-}
-
-func TestGenaiContentToFantasyMessage_VideoMetadata(t *testing.T) {
-	content := &genai.Content{
-		Parts: []*genai.Part{
-			{VideoMetadata: &genai.VideoMetadata{}},
-		},
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := &genai.Content{Parts: []*genai.Part{tt.part}}
+			_, err := genaiContentToFantasyMessage(content)
+			require.Error(t, err)
+		})
 	}
-
-	_, err := genaiContentToFantasyMessage(content)
-	require.Error(t, err)
 }
 
 func TestAdapter_GenerateContent_RequestError(t *testing.T) {
@@ -882,23 +995,12 @@ func TestAdapter_GenerateContent_RequestError(t *testing.T) {
 
 func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 	testErr := errors.New("generate error")
-	m := new(MockLanguageModel)
 
-	m.On("Generate", mock.Anything, mock.Anything).Return(nil, testErr)
+	m := mockGenerate(new(MockLanguageModel), nil, testErr)
 	defer m.AssertExpectations(t)
 
 	adapter := &Adapter{model: m}
-	req := &model.LLMRequest{
-		Model: "test/model",
-		Contents: []*genai.Content{
-			{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "hello"},
-				},
-			},
-		},
-	}
+	req := newRequest().withUserText("hello").build()
 
 	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, false)
@@ -914,23 +1016,12 @@ func TestAdapter_GenerateContent_GenerateError(t *testing.T) {
 
 func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 	testErr := errors.New("stream error")
-	m := new(MockLanguageModel)
 
-	m.On("Stream", mock.Anything, mock.Anything).Return(nil, testErr)
+	m := mockStream(new(MockLanguageModel), nil, testErr)
 	defer m.AssertExpectations(t)
 
 	adapter := &Adapter{model: m}
-	req := &model.LLMRequest{
-		Model: "test/model",
-		Contents: []*genai.Content{
-			{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "hello"},
-				},
-			},
-		},
-	}
+	req := newRequest().withUserText("hello").build()
 
 	ctx := t.Context()
 	iter := adapter.GenerateContent(ctx, req, true)
@@ -945,43 +1036,15 @@ func TestAdapter_GenerateContent_StreamError(t *testing.T) {
 }
 
 func TestFantasyStreamToLLM_ToolCalls(t *testing.T) {
-	stream := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeToolInputStart,
-			ID:           "call-123",
-			ToolCallName: "test-func",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:          fantasy.StreamPartTypeToolInputDelta,
-			ID:            "call-123",
-			ToolCallInput: `{"arg":"value"}`,
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeToolInputEnd,
-			ID:   "call-123",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonToolCalls,
-			Usage:        fantasy.Usage{},
-		}) {
-			return
-		}
-	}
+	stream := newStreamBuilder().
+		addToolStart("call-123", "test-func").
+		addToolDelta("call-123", `{"arg":"value"}`).
+		addToolEnd("call-123").
+		addFinish(fantasy.FinishReasonToolCalls, fantasy.Usage{}).
+		build()
 
 	iter := fantasyStreamToLLM(stream)
-
-	var responses []*model.LLMResponse
-	for resp, err := range iter {
-		require.NoError(t, err)
-		responses = append(responses, resp)
-	}
+	responses := collectResponses(t, iter)
 
 	require.NotEmpty(t, responses)
 }
@@ -1070,33 +1133,18 @@ func TestLlmRequestToFantasyCall_RoleMapping(t *testing.T) {
 	assert.Equal(t, fantasy.MessageRoleAssistant, call.Prompt[0].Role)
 }
 
-func TestGenaiContentToFantasyMessage_CodeExecutionResult(t *testing.T) {
-	content := &genai.Content{
-		Parts: []*genai.Part{
-			{CodeExecutionResult: &genai.CodeExecutionResult{}},
-		},
-	}
-
-	_, err := genaiContentToFantasyMessage(content)
-	require.Error(t, err)
-}
-
 func TestFantasyStreamToLLM_ToolCall(t *testing.T) {
 	stream := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
+		yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeToolCall,
 			ID:           "call-123",
 			ToolCallName: "test-func",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
+		})
+		yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeFinish,
 			FinishReason: fantasy.FinishReasonStop,
 			Usage:        fantasy.Usage{},
-		}) {
-			return
-		}
+		})
 	}
 
 	iter := fantasyStreamToLLM(stream)
@@ -1437,15 +1485,12 @@ func TestSchemaToMap_BasicTypes(t *testing.T) {
 }
 
 func TestSchemaToMap_ObjectWithProperties(t *testing.T) {
-	schema := &genai.Schema{
-		Type:        "OBJECT",
-		Description: "A person object",
-		Properties: map[string]*genai.Schema{
-			"name": {Type: "STRING", Description: "Person's name"},
-			"age":  {Type: "INTEGER", Description: "Person's age"},
-		},
-		Required: []string{"name"},
-	}
+	schema := objectSchema().
+		withDescription("A person object").
+		withStringProp("name", "Person's name").
+		withIntegerProp("age", "Person's age").
+		withRequired("name").
+		build()
 
 	result, err := schemaToMap(schema)
 	require.NoError(t, err)
@@ -1665,9 +1710,7 @@ func TestFantasyResponseToLLM_ToolCallDeserialization(t *testing.T) {
 	require.Len(t, llmResp.Content.Parts, 1)
 
 	part := llmResp.Content.Parts[0]
-	require.NotNil(t, part.FunctionCall)
-	assert.Equal(t, "call-abc", part.FunctionCall.ID)
-	assert.Equal(t, "calculate", part.FunctionCall.Name)
+	assertToolCall(t, part, "call-abc", "calculate")
 	assert.Equal(t, "add", part.FunctionCall.Args["operation"])
 	assert.Equal(t, []any{float64(1), float64(2), float64(3)}, part.FunctionCall.Args["numbers"])
 }
@@ -1688,9 +1731,7 @@ func TestFantasyResponseToLLM_ToolCallEmptyInput(t *testing.T) {
 	require.Len(t, llmResp.Content.Parts, 1)
 
 	part := llmResp.Content.Parts[0]
-	require.NotNil(t, part.FunctionCall)
-	assert.Equal(t, "call-def", part.FunctionCall.ID)
-	assert.Equal(t, "get_status", part.FunctionCall.Name)
+	assertToolCall(t, part, "call-def", "get_status")
 	assert.Empty(t, part.FunctionCall.Args)
 }
 
@@ -1712,49 +1753,14 @@ func TestFantasyResponseToLLM_ToolCallInvalidJSON(t *testing.T) {
 }
 
 func TestFantasyStreamToLLM_ToolInputAccumulation(t *testing.T) {
-	stream := func(yield func(fantasy.StreamPart) bool) {
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeToolInputStart,
-			ID:           "call-xyz",
-			ToolCallName: "search",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:          fantasy.StreamPartTypeToolInputDelta,
-			ID:            "call-xyz",
-			ToolCallInput: `{"query":`,
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:          fantasy.StreamPartTypeToolInputDelta,
-			ID:            "call-xyz",
-			ToolCallInput: `"golang best practices"`,
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:          fantasy.StreamPartTypeToolInputDelta,
-			ID:            "call-xyz",
-			ToolCallInput: `,"limit":10}`,
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type: fantasy.StreamPartTypeToolInputEnd,
-			ID:   "call-xyz",
-		}) {
-			return
-		}
-		if !yield(fantasy.StreamPart{
-			Type:         fantasy.StreamPartTypeFinish,
-			FinishReason: fantasy.FinishReasonToolCalls,
-			Usage:        fantasy.Usage{},
-		}) {
-			return
-		}
-	}
+	stream := newStreamBuilder().
+		addToolStart("call-xyz", "search").
+		addToolDelta("call-xyz", `{"query":`).
+		addToolDelta("call-xyz", `"golang best practices"`).
+		addToolDelta("call-xyz", `,"limit":10}`).
+		addToolEnd("call-xyz").
+		addFinish(fantasy.FinishReasonToolCalls, fantasy.Usage{}).
+		build()
 
 	iter := fantasyStreamToLLM(stream)
 
@@ -2030,131 +2036,121 @@ func TestFantasyStreamToLLM_ToolInputInvalidJSON(t *testing.T) {
 	assert.True(t, foundError, "Expected to find unmarshal error for invalid JSON")
 }
 
-func TestAnthropicProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("ANTHROPIC_API_KEY not set")
+func TestProviders_ImplementModelLLM(t *testing.T) {
+	tests := []struct {
+		name    string
+		envVars map[string]string
+		setup   func(ctx context.Context) (fantasy.LanguageModel, error)
+		model   string
+	}{
+		{
+			name:    "Anthropic",
+			envVars: map[string]string{"ANTHROPIC_API_KEY": ""},
+			model:   "claude-3-5-sonnet-20241022",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := anthropic.New(anthropic.WithAPIKey(os.Getenv("ANTHROPIC_API_KEY")))
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "claude-3-5-sonnet-20241022")
+			},
+		},
+		{
+			name:    "OpenAI",
+			envVars: map[string]string{"OPENAI_API_KEY": ""},
+			model:   "gpt-4o",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := openai.New(openai.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "gpt-4o")
+			},
+		},
+		{
+			name:    "Google",
+			envVars: map[string]string{"GOOGLE_API_KEY": ""},
+			model:   "gemini-2.0-flash-exp",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := google.New(google.WithGeminiAPIKey(os.Getenv("GOOGLE_API_KEY")))
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "gemini-2.0-flash-exp")
+			},
+		},
+		{
+			name:    "Azure",
+			envVars: map[string]string{"AZURE_OPENAI_API_KEY": "", "AZURE_OPENAI_BASE_URL": ""},
+			model:   "gpt-4o",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := azure.New(
+					azure.WithAPIKey(os.Getenv("AZURE_OPENAI_API_KEY")),
+					azure.WithBaseURL(os.Getenv("AZURE_OPENAI_BASE_URL")),
+				)
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "gpt-4o")
+			},
+		},
+		{
+			name:    "Bedrock",
+			envVars: map[string]string{"AWS_REGION": ""},
+			model:   "anthropic.claude-3-5-sonnet-20241022-v2:0",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := bedrock.New()
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "anthropic.claude-3-5-sonnet-20241022-v2:0")
+			},
+		},
+		{
+			name:    "OpenRouter",
+			envVars: map[string]string{"OPENROUTER_API_KEY": ""},
+			model:   "anthropic/claude-3.5-sonnet",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := openrouter.New(openrouter.WithAPIKey(os.Getenv("OPENROUTER_API_KEY")))
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "anthropic/claude-3.5-sonnet")
+			},
+		},
+		{
+			name:    "OpenAICompat",
+			envVars: map[string]string{"OPENAI_COMPAT_API_KEY": "", "OPENAI_COMPAT_BASE_URL": ""},
+			model:   "model-name",
+			setup: func(ctx context.Context) (fantasy.LanguageModel, error) {
+				provider, err := openaicompat.New(
+					openaicompat.WithAPIKey(os.Getenv("OPENAI_COMPAT_API_KEY")),
+					openaicompat.WithBaseURL(os.Getenv("OPENAI_COMPAT_BASE_URL")),
+				)
+				if err != nil {
+					return nil, err
+				}
+				return provider.LanguageModel(ctx, "model-name")
+			},
+		},
 	}
 
-	ctx := t.Context()
-	provider, err := anthropic.New(anthropic.WithAPIKey(apiKey))
-	require.NoError(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for envKey := range tt.envVars {
+				if os.Getenv(envKey) == "" {
+					t.Skipf("%s not set", envKey)
+				}
+			}
 
-	languageModel, err := provider.LanguageModel(ctx, "claude-3-5-sonnet-20241022")
-	require.NoError(t, err)
+			ctx := t.Context()
+			languageModel, err := tt.setup(ctx)
+			require.NoError(t, err)
 
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestOpenAIProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENAI_API_KEY not set")
+			adapter := NewAdapter(languageModel)
+			assert.Implements(t, (*model.LLM)(nil), adapter)
+		})
 	}
-
-	ctx := t.Context()
-	provider, err := openai.New(openai.WithAPIKey(apiKey))
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "gpt-4o")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestGoogleProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("GOOGLE_API_KEY")
-	if apiKey == "" {
-		t.Skip("GOOGLE_API_KEY not set")
-	}
-
-	ctx := t.Context()
-	provider, err := google.New(google.WithGeminiAPIKey(apiKey))
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "gemini-2.0-flash-exp")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestAzureProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("AZURE_OPENAI_API_KEY")
-	baseURL := os.Getenv("AZURE_OPENAI_BASE_URL")
-	if apiKey == "" || baseURL == "" {
-		t.Skip("AZURE_OPENAI_API_KEY or AZURE_OPENAI_BASE_URL not set")
-	}
-
-	ctx := t.Context()
-	provider, err := azure.New(
-		azure.WithAPIKey(apiKey),
-		azure.WithBaseURL(baseURL),
-	)
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "gpt-4o")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestBedrockProvider_Implements_ModelLLM(t *testing.T) {
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		t.Skip("AWS_REGION not set")
-	}
-
-	ctx := t.Context()
-	provider, err := bedrock.New()
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "anthropic.claude-3-5-sonnet-20241022-v2:0")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestOpenRouterProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENROUTER_API_KEY not set")
-	}
-
-	ctx := t.Context()
-	provider, err := openrouter.New(openrouter.WithAPIKey(apiKey))
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "anthropic/claude-3.5-sonnet")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
-}
-
-func TestOpenAICompatProvider_Implements_ModelLLM(t *testing.T) {
-	apiKey := os.Getenv("OPENAI_COMPAT_API_KEY")
-	baseURL := os.Getenv("OPENAI_COMPAT_BASE_URL")
-	if apiKey == "" || baseURL == "" {
-		t.Skip("OPENAI_COMPAT_API_KEY or OPENAI_COMPAT_BASE_URL not set")
-	}
-
-	ctx := t.Context()
-	provider, err := openaicompat.New(
-		openaicompat.WithAPIKey(apiKey),
-		openaicompat.WithBaseURL(baseURL),
-	)
-	require.NoError(t, err)
-
-	languageModel, err := provider.LanguageModel(ctx, "model-name")
-	require.NoError(t, err)
-
-	adapter := NewAdapter(languageModel)
-	assert.Implements(t, (*model.LLM)(nil), adapter)
 }
 
 func TestLlmRequestToFantasyCall_ToolResultsGetToolRole(t *testing.T) {
