@@ -1617,21 +1617,21 @@ func TestFantasyStreamToLLM_MultipleToolCallsAccumulation(t *testing.T) {
 		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeToolInputStart,
 			ID:           "call-1",
-			ToolCallName: "tool1",
+			ToolCallName: "geocode_city",
 		}) {
 			return
 		}
 		if !yield(fantasy.StreamPart{
 			Type:          fantasy.StreamPartTypeToolInputDelta,
 			ID:            "call-1",
-			ToolCallInput: `{"arg1":`,
+			ToolCallInput: `{"city":"San `,
 		}) {
 			return
 		}
 		if !yield(fantasy.StreamPart{
 			Type:          fantasy.StreamPartTypeToolInputDelta,
 			ID:            "call-1",
-			ToolCallInput: `"value1"}`,
+			ToolCallInput: `Francisco, CA"}`,
 		}) {
 			return
 		}
@@ -1644,21 +1644,21 @@ func TestFantasyStreamToLLM_MultipleToolCallsAccumulation(t *testing.T) {
 		if !yield(fantasy.StreamPart{
 			Type:         fantasy.StreamPartTypeToolInputStart,
 			ID:           "call-2",
-			ToolCallName: "tool2",
+			ToolCallName: "get_weather",
 		}) {
 			return
 		}
 		if !yield(fantasy.StreamPart{
 			Type:          fantasy.StreamPartTypeToolInputDelta,
 			ID:            "call-2",
-			ToolCallInput: `{"arg2":`,
+			ToolCallInput: `{"latitude":37.7749,`,
 		}) {
 			return
 		}
 		if !yield(fantasy.StreamPart{
 			Type:          fantasy.StreamPartTypeToolInputDelta,
 			ID:            "call-2",
-			ToolCallInput: `"value2"}`,
+			ToolCallInput: `"longitude":-122.4194}`,
 		}) {
 			return
 		}
@@ -1679,26 +1679,38 @@ func TestFantasyStreamToLLM_MultipleToolCallsAccumulation(t *testing.T) {
 
 	iter := fantasyStreamToLLM(stream)
 
-	foundCalls := make(map[string]bool)
+	foundCalls := make(map[string]map[string]any)
 	for resp, err := range iter {
 		require.NoError(t, err)
 		if resp.Content != nil && len(resp.Content.Parts) > 0 {
 			for _, part := range resp.Content.Parts {
 				if part.FunctionCall != nil {
-					foundCalls[part.FunctionCall.Name] = true
-					switch part.FunctionCall.Name {
-					case "tool1":
-						assert.Equal(t, "value1", part.FunctionCall.Args["arg1"])
-					case "tool2":
-						assert.Equal(t, "value2", part.FunctionCall.Args["arg2"])
-					}
+					foundCalls[part.FunctionCall.Name] = part.FunctionCall.Args
+					t.Logf("Found tool call: %s with args: %+v",
+						part.FunctionCall.Name, part.FunctionCall.Args)
 				}
 			}
 		}
 	}
 
-	assert.True(t, foundCalls["tool1"], "Expected to find tool1 call")
-	assert.True(t, foundCalls["tool2"], "Expected to find tool2 call")
+	require.Len(t, foundCalls, 2, "Should find 2 tool calls")
+
+	require.Contains(t, foundCalls, "geocode_city", "Should find geocode_city tool call")
+	geocodeArgs := foundCalls["geocode_city"]
+	assert.Equal(t, "San Francisco, CA", geocodeArgs["city"],
+		"Geocode city parameter should be 'San Francisco, CA'")
+
+	require.Contains(t, foundCalls, "get_weather", "Should find get_weather tool call")
+	weatherArgs := foundCalls["get_weather"]
+	assert.InDelta(t, 37.7749, weatherArgs["latitude"], 0.0001,
+		"Weather latitude should be 37.7749")
+	assert.InDelta(t, -122.4194, weatherArgs["longitude"], 0.0001,
+		"Weather longitude should be -122.4194")
+
+	assert.NotContains(t, geocodeArgs, "latitude",
+		"Geocode args should not contain weather parameters")
+	assert.NotContains(t, weatherArgs, "city",
+		"Weather args should not contain geocode parameters")
 }
 
 func TestFantasyStreamToLLM_ToolInputInvalidJSON(t *testing.T) {
@@ -2025,4 +2037,398 @@ func TestGenaiContentToFantasyMessage_FunctionCallAndResponseMixed(t *testing.T)
 	_, err := genaiContentToFantasyMessage(content)
 	require.Error(t, err, "Content with both FunctionCall and FunctionResponse should error")
 	assert.Contains(t, err.Error(), "cannot contain both FunctionCall and FunctionResponse")
+}
+
+func TestFantasyStreamToLLM_TextDeltasAreNotAccumulated(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextStart,
+			ID:   "0",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "I'll ",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "get ",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "the ",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "weather",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextEnd,
+			ID:   "0",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonStop,
+			Usage: fantasy.Usage{
+				InputTokens:  10,
+				OutputTokens: 4,
+				TotalTokens:  14,
+			},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var responses []*model.LLMResponse
+	for resp, err := range iter {
+		require.NoError(t, err)
+		responses = append(responses, resp)
+	}
+
+	require.NotEmpty(t, responses)
+
+	// Verify each partial response contains ONLY the delta text, not accumulated
+	// This test SHOULD FAIL with current implementation, proving Bug #1 exists
+	var partialResponses []*model.LLMResponse
+	var finalResponse *model.LLMResponse
+
+	for _, resp := range responses {
+		if resp.TurnComplete {
+			finalResponse = resp
+		} else if resp.Partial {
+			partialResponses = append(partialResponses, resp)
+		}
+	}
+
+	require.Len(t, partialResponses, 4, "Expected 4 partial responses for 4 deltas")
+
+	// Each partial should contain ONLY the delta, not accumulated text
+	assert.Equal(t, "I'll ", partialResponses[0].Content.Parts[0].Text,
+		"First delta should contain ONLY 'I'll ', not accumulated text")
+
+	assert.Equal(t, "get ", partialResponses[1].Content.Parts[0].Text,
+		"Second delta should contain ONLY 'get ', not 'I'll get '")
+
+	assert.Equal(t, "the ", partialResponses[2].Content.Parts[0].Text,
+		"Third delta should contain ONLY 'the ', not 'I'll get the '")
+
+	assert.Equal(t, "weather", partialResponses[3].Content.Parts[0].Text,
+		"Fourth delta should contain ONLY 'weather', not 'I'll get the weather'")
+
+	// Final response should contain the complete accumulated text
+	require.NotNil(t, finalResponse, "Expected final response with TurnComplete=true")
+	require.NotNil(t, finalResponse.Content)
+	require.Len(t, finalResponse.Content.Parts, 1)
+	assert.Equal(t, "I'll get the weather", finalResponse.Content.Parts[0].Text,
+		"Final response should contain complete accumulated text")
+}
+
+func TestFantasyStreamToLLM_PartialFlagCorrect(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextStart,
+			ID:   "0",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "Hello",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: " world",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextEnd,
+			ID:   "0",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonStop,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var responses []*model.LLMResponse
+	for resp, err := range iter {
+		require.NoError(t, err)
+		responses = append(responses, resp)
+	}
+
+	require.Len(t, responses, 3, "Expected 3 responses: 2 deltas + 1 final")
+
+	// First delta response
+	assert.True(t, responses[0].Partial, "Delta response should have Partial=true")
+	assert.False(t, responses[0].TurnComplete, "Delta response should have TurnComplete=false")
+	assert.Empty(t, responses[0].ErrorCode, "Delta response should have no error")
+
+	// Second delta response
+	assert.True(t, responses[1].Partial, "Second delta should have Partial=true")
+	assert.False(t, responses[1].TurnComplete, "Second delta should have TurnComplete=false")
+
+	// Final response
+	assert.False(t, responses[2].Partial, "Final response should have Partial=false")
+	assert.True(t, responses[2].TurnComplete, "Final response should have TurnComplete=true")
+	assert.Equal(t, genai.FinishReasonStop, responses[2].FinishReason)
+	require.NotNil(t, responses[2].UsageMetadata, "Final response should have usage metadata")
+}
+
+func TestFantasyStreamToLLM_ToolParametersNotLost(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-geocode",
+			ToolCallName: "geocode_city",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-geocode",
+			ToolCallInput: `{"city":"New York City, NY","unit":"c`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-geocode",
+			ToolCallInput: `elsius","forecast_days":7,"include_hour`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-geocode",
+			ToolCallInput: `ly":true}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-geocode",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage:        fantasy.Usage{},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundToolCall bool
+	var toolCallArgs map[string]any
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil && part.FunctionCall.Name == "geocode_city" {
+					foundToolCall = true
+					toolCallArgs = part.FunctionCall.Args
+
+					t.Logf("Tool call ID: %s", part.FunctionCall.ID)
+					t.Logf("Tool call Name: %s", part.FunctionCall.Name)
+					t.Logf("Tool call Args: %+v", part.FunctionCall.Args)
+
+					// Verify all parameters are present and correct
+					assert.Equal(t, "call-geocode", part.FunctionCall.ID,
+						"Tool call ID should match")
+					assert.Equal(t, "geocode_city", part.FunctionCall.Name,
+						"Tool call name should match")
+
+					// Check each parameter
+					require.Contains(t, toolCallArgs, "city",
+						"Args should contain 'city' parameter")
+					assert.Equal(t, "New York City, NY", toolCallArgs["city"],
+						"City parameter should be 'New York City, NY'")
+
+					require.Contains(t, toolCallArgs, "unit",
+						"Args should contain 'unit' parameter")
+					assert.Equal(t, "celsius", toolCallArgs["unit"],
+						"Unit parameter should be 'celsius'")
+
+					require.Contains(t, toolCallArgs, "forecast_days",
+						"Args should contain 'forecast_days' parameter")
+					assert.InDelta(t, 7.0, toolCallArgs["forecast_days"], 0.001,
+						"Forecast days should be 7")
+
+					require.Contains(t, toolCallArgs, "include_hourly",
+						"Args should contain 'include_hourly' parameter")
+					assert.Equal(t, true, toolCallArgs["include_hourly"],
+						"Include hourly should be true")
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundToolCall, "Should find tool call in stream")
+	assert.Len(t, toolCallArgs, 4, "Should have all 4 parameters")
+}
+
+func TestFantasyStreamToLLM_CompleteToolCallFlow(t *testing.T) {
+	stream := func(yield func(fantasy.StreamPart) bool) {
+		// Text response: "I'll get the weather for you."
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextStart,
+			ID:   "0",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "I'll get ",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "the weather ",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:  fantasy.StreamPartTypeTextDelta,
+			ID:    "0",
+			Delta: "for you.",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeTextEnd,
+			ID:   "0",
+		}) {
+			return
+		}
+
+		// Tool call: geocode_city
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeToolInputStart,
+			ID:           "call-geocode",
+			ToolCallName: "geocode_city",
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-geocode",
+			ToolCallInput: `{"city":"New `,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type:          fantasy.StreamPartTypeToolInputDelta,
+			ID:            "call-geocode",
+			ToolCallInput: `York City, NY"}`,
+		}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{
+			Type: fantasy.StreamPartTypeToolInputEnd,
+			ID:   "call-geocode",
+		}) {
+			return
+		}
+
+		if !yield(fantasy.StreamPart{
+			Type:         fantasy.StreamPartTypeFinish,
+			FinishReason: fantasy.FinishReasonToolCalls,
+			Usage: fantasy.Usage{
+				InputTokens:  15,
+				OutputTokens: 25,
+				TotalTokens:  40,
+			},
+		}) {
+			return
+		}
+	}
+
+	iter := fantasyStreamToLLM(stream)
+
+	var textResponses []string
+	var toolCalls []*genai.FunctionCall
+	var finalResponse *model.LLMResponse
+
+	for resp, err := range iter {
+		require.NoError(t, err)
+
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.Text != "" {
+					textResponses = append(textResponses, part.Text)
+					t.Logf("Text delta: %q", part.Text)
+				}
+				if part.FunctionCall != nil {
+					toolCalls = append(toolCalls, part.FunctionCall)
+					t.Logf("Tool call: %s with args: %+v",
+						part.FunctionCall.Name, part.FunctionCall.Args)
+				}
+			}
+		}
+
+		if resp.TurnComplete {
+			finalResponse = resp
+		}
+	}
+
+	// Verify complete conversation flow
+	require.NotNil(t, finalResponse, "Should have final response")
+
+	// Verify tool call was found with correct parameters
+	require.Len(t, toolCalls, 1, "Should have exactly 1 tool call")
+	assert.Equal(t, "call-geocode", toolCalls[0].ID)
+	assert.Equal(t, "geocode_city", toolCalls[0].Name)
+
+	require.Contains(t, toolCalls[0].Args, "city",
+		"Tool call should have 'city' parameter")
+	assert.Equal(t, "New York City, NY", toolCalls[0].Args["city"],
+		"City parameter should match exactly")
+
+	// Verify final response has usage metadata
+	require.NotNil(t, finalResponse.UsageMetadata)
+	assert.Equal(t, int32(15), finalResponse.UsageMetadata.PromptTokenCount)
+	assert.Equal(t, int32(25), finalResponse.UsageMetadata.CandidatesTokenCount)
+	assert.Equal(t, int32(40), finalResponse.UsageMetadata.TotalTokenCount)
+
+	assert.Equal(t, genai.FinishReasonStop, finalResponse.FinishReason)
+
+	t.Logf("Complete conversation flow test passed:")
+	t.Logf("  - Text responses: %d", len(textResponses))
+	t.Logf("  - Tool calls: %d", len(toolCalls))
+	t.Logf("  - Final response present: %v", finalResponse != nil)
 }
