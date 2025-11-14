@@ -1244,6 +1244,155 @@ func TestGenaiToolsToFantasyTools_SystemInformationTool(t *testing.T) {
 	assert.Equal(t, []string{"detailed"}, ft.InputSchema["required"])
 }
 
+func TestGenaiToolsToFantasyTools_ParametersJsonSchemaAsMap(t *testing.T) {
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:        "geocode_city",
+					Description: "Convert US city name to geographic coordinates",
+					ParametersJsonSchema: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"city_name": map[string]any{
+								"type":        "string",
+								"description": "US city name",
+							},
+						},
+						"required": []any{"city_name"},
+					},
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+	assert.Equal(t, "geocode_city", ft.Name)
+	assert.Equal(t, "Convert US city name to geographic coordinates", ft.Description)
+
+	require.NotNil(t, ft.InputSchema)
+	assert.Equal(t, "object", ft.InputSchema["type"])
+
+	assert.Contains(t, ft.InputSchema, "properties")
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+
+	assert.Contains(t, props, "city_name")
+	cityName, ok := props["city_name"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "string", cityName["type"])
+	assert.Equal(t, "US city name", cityName["description"])
+
+	assert.Contains(t, ft.InputSchema, "required")
+}
+
+func TestGenaiToolsToFantasyTools_ParametersJsonSchemaAsBytes(t *testing.T) {
+	schemaJSON := []byte(`{
+		"type": "object",
+		"properties": {
+			"latitude": {
+				"type": "number",
+				"description": "Latitude coordinate"
+			},
+			"longitude": {
+				"type": "number",
+				"description": "Longitude coordinate"
+			}
+		},
+		"required": ["latitude", "longitude"]
+	}`)
+
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:                 "get_weather",
+					Description:          "Get weather forecast for coordinates",
+					ParametersJsonSchema: schemaJSON,
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+	assert.Equal(t, "get_weather", ft.Name)
+
+	require.NotNil(t, ft.InputSchema)
+	assert.Equal(t, "object", ft.InputSchema["type"])
+
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, props, "latitude")
+	assert.Contains(t, props, "longitude")
+
+	lat, ok := props["latitude"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "number", lat["type"])
+	assert.Equal(t, "Latitude coordinate", lat["description"])
+
+	lon, ok := props["longitude"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "number", lon["type"])
+	assert.Equal(t, "Longitude coordinate", lon["description"])
+
+	required, ok := ft.InputSchema["required"].([]any)
+	require.True(t, ok)
+	assert.Len(t, required, 2)
+}
+
+func TestGenaiToolsToFantasyTools_BothParametersAndJsonSchema(t *testing.T) {
+	tools := []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{
+					Name:        "test_tool",
+					Description: "Test tool with Parameters field",
+					Parameters: &genai.Schema{
+						Type: "object",
+						Properties: map[string]*genai.Schema{
+							"param1": {
+								Type:        "string",
+								Description: "From Parameters field",
+							},
+						},
+					},
+					ParametersJsonSchema: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"param2": map[string]any{
+								"type":        "string",
+								"description": "From ParametersJsonSchema field",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fantasyTools, err := genaiToolsToFantasyTools(tools)
+	require.NoError(t, err)
+	require.Len(t, fantasyTools, 1)
+
+	ft, ok := fantasyTools[0].(fantasy.FunctionTool)
+	require.True(t, ok)
+
+	props, ok := ft.InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, props, "param1", "Should use Parameters field when both are present")
+	assert.NotContains(t, props, "param2", "Should prefer Parameters over ParametersJsonSchema")
+}
+
 func TestSchemaToMap_NilSchema(t *testing.T) {
 	result, err := schemaToMap(nil)
 	require.NoError(t, err)

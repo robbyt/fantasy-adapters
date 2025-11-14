@@ -515,6 +515,22 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 					} else if schemaMap != nil {
 						params = schemaMap
 					}
+				} else if fn.ParametersJsonSchema != nil {
+					switch v := fn.ParametersJsonSchema.(type) {
+					case map[string]any:
+						params = v
+					case []byte:
+						if err := json.Unmarshal(v, &params); err != nil {
+							errs = append(errs, fmt.Errorf("failed to unmarshal ParametersJsonSchema for function %q: %w", fn.Name, err))
+						}
+					default:
+						jsonBytes, err := json.Marshal(v)
+						if err != nil {
+							errs = append(errs, fmt.Errorf("failed to marshal ParametersJsonSchema for function %q: %w", fn.Name, err))
+						} else if err := json.Unmarshal(jsonBytes, &params); err != nil {
+							errs = append(errs, fmt.Errorf("failed to unmarshal ParametersJsonSchema for function %q: %w", fn.Name, err))
+						}
+					}
 				}
 				fantasyTools = append(fantasyTools, fantasy.FunctionTool{
 					Name:        fn.Name,
