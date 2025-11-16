@@ -35,13 +35,15 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
+	anthropic "charm.land/fantasy/providers/anthropic"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
 )
 
 // Adapter wraps a fantasy.LanguageModel to implement the Google ADK model.LLM interface.
 type Adapter struct {
-	model fantasy.LanguageModel
+	model           fantasy.LanguageModel
+	schemaConverter SchemaConverter
 }
 
 const (
@@ -56,8 +58,22 @@ const (
 )
 
 // NewAdapter creates a new ADK adapter for the given fantasy language model.
+// Uses manual schema conversion by default for optimal performance (~5.6x faster than JSON).
 func NewAdapter(m fantasy.LanguageModel) model.LLM {
-	return &Adapter{model: m}
+	return &Adapter{
+		model:           m,
+		schemaConverter: NewManualSchemaConverter(),
+	}
+}
+
+// NewAdapterWithSchemaConverter creates an Adapter with a custom schema converter.
+// Use NewJSONSchemaConverter() for maintainability at the cost of performance (~5.6x slower).
+// Example: NewAdapterWithSchemaConverter(model, NewJSONSchemaConverter())
+func NewAdapterWithSchemaConverter(m fantasy.LanguageModel, converter SchemaConverter) model.LLM {
+	return &Adapter{
+		model:           m,
+		schemaConverter: converter,
+	}
 }
 
 // Name implements model.LLM.
@@ -79,7 +95,7 @@ func (a *Adapter) Name() string {
 //   - Interrupted: false (not tracked)
 //   - AvgLogprobs: 0 (not supported by fantasy)
 func (a *Adapter) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
-	call, err := llmRequestToFantasyCall(req)
+	call, err := a.llmRequestToFantasyCall(req)
 	if err != nil {
 		return func(yield func(*model.LLMResponse, error) bool) {
 			yield(nil, err)
@@ -226,11 +242,11 @@ func getToolChoiceForMode(mode string, allowedNames []string) (*fantasy.ToolChoi
 
 // applyTools converts ADK tools and tool configuration to fantasy.Call tools and tool choice.
 // Handles tool filtering by AllowedFunctionNames and tool choice mode selection.
-func applyTools(call *fantasy.Call, tools []*genai.Tool, toolConfig *genai.ToolConfig) []error {
+func (a *Adapter) applyTools(call *fantasy.Call, tools []*genai.Tool, toolConfig *genai.ToolConfig) []error {
 	var errs []error
 
 	if len(tools) > 0 {
-		fantasyTools, err := genaiToolsToFantasyTools(tools)
+		fantasyTools, err := a.genaiToolsToFantasyTools(tools)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("tools: %w", err))
 		} else {
@@ -291,7 +307,7 @@ func applyTools(call *fantasy.Call, tools []*genai.Tool, toolConfig *genai.ToolC
 //   - CachedContent, FileData URIs
 //   - Retrieval/code execution tools
 //   - AllowedFunctionNames containing non-existent function names
-func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
+func (a *Adapter) llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 	var call fantasy.Call
 	var errs []error
 
@@ -310,7 +326,7 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 		}
 
 		// Apply tools and tool configuration
-		errs = append(errs, applyTools(&call, req.Config.Tools, req.Config.ToolConfig)...)
+		errs = append(errs, a.applyTools(&call, req.Config.Tools, req.Config.ToolConfig)...)
 	}
 
 	for _, content := range req.Contents {
@@ -375,7 +391,16 @@ func genaiContentToFantasyMessage(content *genai.Content) (fantasy.Message, erro
 
 	for _, part := range content.Parts {
 		if part.Text != "" && part.Thought {
-			msg.Content = append(msg.Content, fantasy.ReasoningPart{Text: part.Text})
+			reasoningPart := fantasy.ReasoningPart{Text: part.Text}
+			// Preserve signature for multi-turn context
+			if len(part.ThoughtSignature) > 0 {
+				reasoningPart.ProviderOptions = fantasy.ProviderOptions{
+					"anthropic": &anthropic.ReasoningOptionMetadata{
+						Signature: string(part.ThoughtSignature),
+					},
+				}
+			}
+			msg.Content = append(msg.Content, reasoningPart)
 		} else if part.Text != "" {
 			msg.Content = append(msg.Content, fantasy.TextPart{Text: part.Text})
 		} else if part.InlineData != nil {
@@ -436,203 +461,6 @@ func genaiSystemInstructionToFantasyMessage(content *genai.Content) (fantasy.Mes
 	return msg, nil
 }
 
-func schemaToMap(schema *genai.Schema) (map[string]any, error) {
-	if schema == nil {
-		return nil, nil
-	}
-
-	slog.Default().Debug("Manual schema conversion", "schema_type", schema.Type)
-	result := make(map[string]any)
-
-	if schema.Type != "" {
-		result["type"] = strings.ToLower(string(schema.Type))
-	}
-
-	if schema.Description != "" {
-		result["description"] = schema.Description
-	}
-
-	if schema.Title != "" {
-		result["title"] = schema.Title
-	}
-
-	if len(schema.Properties) > 0 {
-		props := make(map[string]any)
-		for key, val := range schema.Properties {
-			propMap, err := schemaToMap(val)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert property %q: %w", key, err)
-			}
-			props[key] = propMap
-		}
-		result["properties"] = props
-	}
-
-	if schema.Items != nil {
-		items, err := schemaToMap(schema.Items)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert items: %w", err)
-		}
-		result["items"] = items
-	}
-
-	if len(schema.Required) > 0 {
-		result["required"] = schema.Required
-	}
-
-	if len(schema.Enum) > 0 {
-		result["enum"] = schema.Enum
-	}
-
-	if schema.Format != "" {
-		result["format"] = schema.Format
-	}
-
-	if schema.Pattern != "" {
-		result["pattern"] = schema.Pattern
-	}
-
-	if schema.Minimum != nil {
-		result["minimum"] = *schema.Minimum
-	}
-
-	if schema.Maximum != nil {
-		result["maximum"] = *schema.Maximum
-	}
-
-	if schema.MinLength != nil {
-		result["minLength"] = *schema.MinLength
-	}
-
-	if schema.MaxLength != nil {
-		result["maxLength"] = *schema.MaxLength
-	}
-
-	if schema.MinItems != nil {
-		result["minItems"] = *schema.MinItems
-	}
-
-	if schema.MaxItems != nil {
-		result["maxItems"] = *schema.MaxItems
-	}
-
-	if schema.MinProperties != nil {
-		result["minProperties"] = *schema.MinProperties
-	}
-
-	if schema.MaxProperties != nil {
-		result["maxProperties"] = *schema.MaxProperties
-	}
-
-	if schema.Nullable != nil {
-		result["nullable"] = *schema.Nullable
-	}
-
-	if schema.Default != nil {
-		result["default"] = schema.Default
-	}
-
-	if schema.Example != nil {
-		result["example"] = schema.Example
-	}
-
-	if len(schema.PropertyOrdering) > 0 {
-		result["propertyOrdering"] = schema.PropertyOrdering
-	}
-
-	if len(schema.AnyOf) > 0 {
-		anyOf := make([]any, len(schema.AnyOf))
-		for i, s := range schema.AnyOf {
-			schemaMap, err := schemaToMap(s)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert anyOf[%d]: %w", i, err)
-			}
-			anyOf[i] = schemaMap
-		}
-		result["anyOf"] = anyOf
-	}
-
-	return result, nil
-}
-
-// schemaToMapJSON converts a genai.Schema to map[string]any using JSON round-trip.
-// This is an alternative to schemaToMap that uses standard library serialization.
-// Still requires normalizeSchemaArrays to maintain Bug #5 fix for MCP compatibility.
-func schemaToMapJSON(schema *genai.Schema) (map[string]any, error) {
-	if schema == nil {
-		return nil, nil
-	}
-
-	slog.Default().Debug("JSON schema conversion", "schema_type", schema.Type)
-
-	// Marshal schema to JSON bytes
-	jsonBytes, err := json.Marshal(schema)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal schema: %w", err)
-	}
-
-	// Unmarshal JSON bytes to map
-	var result map[string]any
-	if err := json.Unmarshal(jsonBytes, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal schema: %w", err)
-	}
-
-	// Lowercase type field to match manual conversion behavior (per JSON Schema spec)
-	lowercaseTypeField(result)
-
-	// CRITICAL: Normalize arrays for Bug #5 fix (MCP strict JSON schema compatibility)
-	normalizeSchemaArrays(result)
-
-	return result, nil
-}
-
-// lowercaseTypeField recursively lowercases all "type" fields in the schema map.
-// This ensures consistency with the manual schemaToMap implementation and JSON Schema spec.
-func lowercaseTypeField(schema map[string]any) {
-	if typeVal, ok := schema["type"]; ok {
-		if typeStr, ok := typeVal.(string); ok {
-			schema["type"] = strings.ToLower(typeStr)
-		}
-	}
-
-	// Recursively lowercase in nested properties
-	if props, ok := schema["properties"].(map[string]any); ok {
-		for _, prop := range props {
-			if propSchema, ok := prop.(map[string]any); ok {
-				lowercaseTypeField(propSchema)
-			}
-		}
-	}
-
-	// Lowercase in array items schema
-	if items, ok := schema["items"].(map[string]any); ok {
-		lowercaseTypeField(items)
-	}
-
-	// Recursively lowercase in anyOf schemas
-	if anyOf, ok := schema["anyOf"].([]interface{}); ok {
-		for _, item := range anyOf {
-			if subSchema, ok := item.(map[string]any); ok {
-				lowercaseTypeField(subSchema)
-			}
-		}
-	}
-}
-
-// schemaConverter is the active schema conversion strategy.
-// Can be toggled using UseJSONSchemaConversion() and UseManualSchemaConversion().
-var schemaConverter = schemaToMap
-
-// UseJSONSchemaConversion switches to JSON round-trip schema conversion.
-func UseJSONSchemaConversion() {
-	schemaConverter = schemaToMapJSON
-}
-
-// UseManualSchemaConversion switches to manual schema conversion (default).
-func UseManualSchemaConversion() {
-	schemaConverter = schemaToMap
-}
-
 // normalizeStringArrayField converts a []interface{} field to []string for the given field name.
 // This is necessary for JSON Schema fields that must be string arrays (required, enum, propertyOrdering).
 func normalizeStringArrayField(schema map[string]any, fieldName string) {
@@ -683,7 +511,7 @@ func normalizeSchemaArrays(schema map[string]any) {
 	}
 }
 
-func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
+func (a *Adapter) genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 	var fantasyTools []fantasy.Tool
 	var errs []error
 
@@ -701,7 +529,7 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 				params := make(map[string]any)
 				if fn.Parameters != nil {
 					slog.Default().Debug("Using genai.Schema Parameters", "tool_name", fn.Name)
-					schemaMap, err := schemaConverter(fn.Parameters)
+					schemaMap, err := a.schemaConverter.Convert(fn.Parameters)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("failed to convert schema for function %q: %w", fn.Name, err))
 					} else if schemaMap != nil {
@@ -1083,7 +911,17 @@ func (p *streamProcessor) handleReasoningDelta(part fantasy.StreamPart, yield fu
 }
 
 // handleReasoningEnd processes reasoning end stream parts.
-func (p *streamProcessor) handleReasoningEnd() {
+func (p *streamProcessor) handleReasoningEnd(part fantasy.StreamPart) {
+	// Extract and preserve signature for multi-turn context
+	if p.currentPart != nil {
+		if metadata, ok := part.ProviderMetadata["anthropic"]; ok {
+			if reasoningMeta, ok := metadata.(*anthropic.ReasoningOptionMetadata); ok {
+				if reasoningMeta.Signature != "" {
+					p.currentPart.ThoughtSignature = []byte(reasoningMeta.Signature)
+				}
+			}
+		}
+	}
 	p.currentPart = nil
 	p.partIndex++
 }
@@ -1095,13 +933,18 @@ func (p *streamProcessor) handleFinish(part fantasy.StreamPart, yield func(*mode
 		"input_tokens", part.Usage.InputTokens,
 		"output_tokens", part.Usage.OutputTokens)
 	finalContent := p.currentContent
-	if p.currentContent != nil && len(p.yieldedToolIDs) > 0 {
+	if p.currentContent != nil && len(p.currentContent.Parts) > 0 {
 		filteredParts := make([]*genai.Part, 0)
 		for _, part := range p.currentContent.Parts {
+			// Filter already-yielded tool calls
 			if part.FunctionCall != nil {
 				if p.yieldedToolIDs[part.FunctionCall.ID] {
 					continue
 				}
+			}
+			// Filter reasoning Parts (already yielded as deltas during streaming)
+			if part.Thought {
+				continue
 			}
 			filteredParts = append(filteredParts, part)
 		}
@@ -1176,7 +1019,7 @@ func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMRespo
 					return
 				}
 			case fantasy.StreamPartTypeReasoningEnd:
-				processor.handleReasoningEnd()
+				processor.handleReasoningEnd(part)
 			case fantasy.StreamPartTypeFinish:
 				if !processor.handleFinish(part, yield) {
 					return

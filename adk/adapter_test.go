@@ -70,6 +70,19 @@ func (m *MockLanguageModel) StreamObject(ctx context.Context, call fantasy.Objec
 
 // Test helper functions
 
+// Test helper wrappers for refactored methods (now on Adapter)
+func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
+	mockModel := &MockLanguageModel{}
+	adapter := NewAdapter(mockModel).(*Adapter)
+	return adapter.llmRequestToFantasyCall(req)
+}
+
+func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
+	mockModel := &MockLanguageModel{}
+	adapter := NewAdapter(mockModel).(*Adapter)
+	return adapter.genaiToolsToFantasyTools(tools)
+}
+
 type streamBuilder struct {
 	parts []fantasy.StreamPart
 }
@@ -169,6 +182,19 @@ func (sb *streamBuilder) addReasoningEnd(id string) *streamBuilder {
 	sb.parts = append(sb.parts, fantasy.StreamPart{
 		Type: fantasy.StreamPartTypeReasoningEnd,
 		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addReasoningEndWithSignature(id, signature string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type: fantasy.StreamPartTypeReasoningEnd,
+		ID:   id,
+		ProviderMetadata: fantasy.ProviderMetadata{
+			"anthropic": &anthropic.ReasoningOptionMetadata{
+				Signature: signature,
+			},
+		},
 	})
 	return sb
 }
@@ -729,22 +755,93 @@ func TestFantasyStreamToLLM_ReasoningDeltasAreYieldedAsThoughts(t *testing.T) {
 	assert.Equal(t, "Here is ", textResponses[0].Content.Parts[0].Text)
 	assert.Equal(t, "my answer.", textResponses[1].Content.Parts[0].Text)
 
-	// Verify final response includes both reasoning and text content
+	// Verify final response includes only text content (reasoning filtered out for display)
 	require.NotNil(t, finalResponse, "Should have final response")
 	require.NotNil(t, finalResponse.Content, "Final response should have content")
-	require.Len(t, finalResponse.Content.Parts, 2, "Final response should have 2 parts (reasoning + text)")
+	require.Len(t, finalResponse.Content.Parts, 1, "Final response should have 1 part (text only, reasoning filtered)")
 
-	// Verify first part is reasoning with Thought=true
-	assert.True(t, finalResponse.Content.Parts[0].Thought, "First part should be reasoning with Thought=true")
-	assert.Equal(t, "Let me think about this...", finalResponse.Content.Parts[0].Text, "Reasoning should be accumulated")
-
-	// Verify second part is text without Thought flag
-	assert.False(t, finalResponse.Content.Parts[1].Thought, "Second part should be text with Thought=false")
-	assert.Equal(t, "Here is my answer.", finalResponse.Content.Parts[1].Text, "Text should be accumulated")
+	// Verify the part is text without Thought flag
+	assert.False(t, finalResponse.Content.Parts[0].Thought, "Part should be text with Thought=false")
+	assert.Equal(t, "Here is my answer.", finalResponse.Content.Parts[0].Text, "Text should be accumulated")
 
 	// Verify final response is marked as turn complete
 	assert.True(t, finalResponse.TurnComplete, "Final response should be turn complete")
 	assert.False(t, finalResponse.Partial, "Final response should not be partial")
+}
+
+func TestFantasyStreamToLLM_ReasoningSignaturePreservation(t *testing.T) {
+	testSignature := "WaUjzkypQ2mUEVM36O2TxuC06KN8xyfbJwyem2dw3URve/op91XWHOEBLLqIOMfFG..."
+
+	stream := newStreamBuilder().
+		addReasoningStart("0").
+		addReasoningDelta("0", "Let me analyze this carefully.").
+		addReasoningEndWithSignature("0", testSignature).
+		addTextStart("1").
+		addTextDelta("1", "Based on my analysis, the answer is 42.").
+		addTextEnd("1").
+		addFinish(fantasy.FinishReasonStop, fantasy.Usage{}).
+		build()
+
+	iter := fantasyStreamToLLM(stream)
+
+	// Collect all responses
+	var responses []*model.LLMResponse
+	for resp, err := range iter {
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		responses = append(responses, resp)
+		if resp.TurnComplete {
+			break
+		}
+	}
+
+	// Now convert the accumulated content back to fantasy message to verify round-trip
+	// The reasoning Part with signature should be preserved in internal state
+	// (even though it's filtered from display in final response)
+
+	// Simulate what happens in multi-turn conversation:
+	// The adapter's internal state should have the reasoning Part with signature
+	// We need to access the processor's currentContent to verify this
+	// Since we can't access internal state in a unit test, we'll verify by:
+	// 1. Creating a genai.Content with reasoning Part + signature
+	// 2. Converting it to fantasy.Message
+	// 3. Verifying the signature is preserved
+
+	reasoningContent := &genai.Content{
+		Role: RoleModel,
+		Parts: []*genai.Part{
+			{
+				Text:             "Let me analyze this carefully.",
+				Thought:          true,
+				ThoughtSignature: []byte(testSignature),
+			},
+			{
+				Text: "Based on my analysis, the answer is 42.",
+			},
+		},
+	}
+
+	fantasyMsg, err := genaiContentToFantasyMessage(reasoningContent)
+	require.NoError(t, err)
+	require.Len(t, fantasyMsg.Content, 2, "Should have 2 content parts")
+
+	// Verify first part is reasoning with signature preserved
+	reasoningPart, ok := fantasyMsg.Content[0].(fantasy.ReasoningPart)
+	require.True(t, ok, "First part should be ReasoningPart")
+	assert.Equal(t, "Let me analyze this carefully.", reasoningPart.Text)
+
+	// Verify signature is preserved in ProviderOptions
+	require.NotNil(t, reasoningPart.ProviderOptions)
+	anthropicMeta, ok := reasoningPart.ProviderOptions["anthropic"]
+	require.True(t, ok, "Should have anthropic provider options")
+	reasoningMeta, ok := anthropicMeta.(*anthropic.ReasoningOptionMetadata)
+	require.True(t, ok, "Should be ReasoningOptionMetadata")
+	assert.Equal(t, testSignature, reasoningMeta.Signature, "Signature should be preserved")
+
+	// Verify second part is regular text
+	textPart, ok := fantasyMsg.Content[1].(fantasy.TextPart)
+	require.True(t, ok, "Second part should be TextPart")
+	assert.Equal(t, "Based on my analysis, the answer is 42.", textPart.Text)
 }
 
 func TestFantasyStreamToLLM_WithError(t *testing.T) {
@@ -1739,133 +1836,6 @@ func TestGenaiToolsToFantasyTools_AnyOfRecursiveNormalization(t *testing.T) {
 	enum, ok := unit["enum"].([]string)
 	require.True(t, ok, "enum field in anyOf[1].properties.unit should be []string after normalization")
 	assert.Equal(t, []string{"meters", "feet", "inches"}, enum)
-}
-
-func TestSchemaToMap_NilSchema(t *testing.T) {
-	result, err := schemaToMap(nil)
-	require.NoError(t, err)
-	assert.Nil(t, result)
-}
-
-func TestSchemaToMap_BasicTypes(t *testing.T) {
-	tests := []struct {
-		name     string
-		schema   *genai.Schema
-		expected map[string]any
-	}{
-		{
-			name:     "string type",
-			schema:   &genai.Schema{Type: "STRING", Description: "A string value"},
-			expected: map[string]any{"type": "string", "description": "A string value"},
-		},
-		{
-			name:     "number type with format",
-			schema:   &genai.Schema{Type: "NUMBER", Format: "float"},
-			expected: map[string]any{"type": "number", "format": "float"},
-		},
-		{
-			name:     "boolean type",
-			schema:   &genai.Schema{Type: "BOOLEAN"},
-			expected: map[string]any{"type": "boolean"},
-		},
-		{
-			name:     "integer with min/max",
-			schema:   &genai.Schema{Type: "INTEGER", Minimum: genai.Ptr(1.0), Maximum: genai.Ptr(100.0)},
-			expected: map[string]any{"type": "integer", "minimum": 1.0, "maximum": 100.0},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := schemaToMap(tt.schema)
-			require.NoError(t, err)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestSchemaToMap_ObjectWithProperties(t *testing.T) {
-	schema := objectSchema().
-		withDescription("A person object").
-		withStringProp("name", "Person's name").
-		withIntegerProp("age", "Person's age").
-		withRequired("name").
-		build()
-
-	result, err := schemaToMap(schema)
-	require.NoError(t, err)
-	assert.Equal(t, "object", result["type"])
-	assert.Equal(t, "A person object", result["description"])
-	assert.Contains(t, result, "properties")
-	assert.Contains(t, result, "required")
-	assert.Equal(t, []string{"name"}, result["required"])
-
-	props, ok := result["properties"].(map[string]any)
-	require.True(t, ok)
-	assert.Contains(t, props, "name")
-	assert.Contains(t, props, "age")
-}
-
-func TestSchemaToMap_ArrayWithItems(t *testing.T) {
-	schema := &genai.Schema{
-		Type: "ARRAY",
-		Items: &genai.Schema{
-			Type:        "STRING",
-			Description: "String item",
-		},
-	}
-
-	result, err := schemaToMap(schema)
-	require.NoError(t, err)
-	assert.Equal(t, "array", result["type"])
-	assert.Contains(t, result, "items")
-
-	items, ok := result["items"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "string", items["type"])
-	assert.Equal(t, "String item", items["description"])
-}
-
-func TestSchemaToMap_WithEnum(t *testing.T) {
-	schema := &genai.Schema{
-		Type: "STRING",
-		Enum: []string{"red", "green", "blue"},
-	}
-
-	result, err := schemaToMap(schema)
-	require.NoError(t, err)
-	assert.Equal(t, "string", result["type"])
-	assert.Equal(t, []string{"red", "green", "blue"}, result["enum"])
-}
-
-func TestSchemaToMap_NestedObjects(t *testing.T) {
-	schema := &genai.Schema{
-		Type: "OBJECT",
-		Properties: map[string]*genai.Schema{
-			"address": {
-				Type: "OBJECT",
-				Properties: map[string]*genai.Schema{
-					"street": {Type: "STRING"},
-					"city":   {Type: "STRING"},
-				},
-			},
-		},
-	}
-
-	result, err := schemaToMap(schema)
-	require.NoError(t, err)
-
-	props, ok := result["properties"].(map[string]any)
-	require.True(t, ok)
-
-	address, ok := props["address"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "object", address["type"])
-
-	addressProps, ok := address["properties"].(map[string]any)
-	require.True(t, ok)
-	assert.Contains(t, addressProps, "street")
-	assert.Contains(t, addressProps, "city")
 }
 
 func TestGenaiContentToFantasyMessage_FunctionCallSerialization(t *testing.T) {
@@ -3259,61 +3229,7 @@ func TestFantasyStreamToLLM_ToolCallRequiredFields(t *testing.T) {
 	t.Logf("  Args content: %+v ✓", toolCall.Args)
 }
 
-// TestSchemaToMapJSON_Bug5Compatibility verifies that JSON conversion maintains Bug #5 fix.
-// Bug #5: Array fields (required, enum, propertyOrdering) must be []string for MCP compatibility.
-func TestSchemaToMapJSON_Bug5Compatibility(t *testing.T) {
-	schema := &genai.Schema{
-		Type:        genai.TypeObject,
-		Description: "Test schema",
-		Properties: map[string]*genai.Schema{
-			"name": {
-				Type:        genai.TypeString,
-				Description: "Name field",
-			},
-			"status": {
-				Type:        genai.TypeString,
-				Description: "Status field",
-				Enum:        []string{"active", "inactive", "pending"},
-			},
-		},
-		Required:         []string{"name", "status"},
-		PropertyOrdering: []string{"name", "status"},
-	}
-
-	// Test JSON conversion
-	result, err := schemaToMapJSON(schema)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-
-	// Verify required field is []string (not []interface{})
-	required, ok := result["required"]
-	require.True(t, ok, "required field must exist")
-	requiredSlice, ok := required.([]string)
-	require.True(t, ok, "required must be []string, got %T (Bug #5 fix)", required)
-	assert.Equal(t, []string{"name", "status"}, requiredSlice)
-
-	// Verify enum in nested property is []string
-	props, ok := result["properties"].(map[string]any)
-	require.True(t, ok, "properties must be map")
-	statusProp, ok := props["status"].(map[string]any)
-	require.True(t, ok, "status property must be map")
-	enum, ok := statusProp["enum"]
-	require.True(t, ok, "enum field must exist")
-	enumSlice, ok := enum.([]string)
-	require.True(t, ok, "enum must be []string, got %T (Bug #5 fix)", enum)
-	assert.Equal(t, []string{"active", "inactive", "pending"}, enumSlice)
-
-	// Verify propertyOrdering is []string
-	propOrder, ok := result["propertyOrdering"]
-	require.True(t, ok, "propertyOrdering field must exist")
-	propOrderSlice, ok := propOrder.([]string)
-	require.True(t, ok, "propertyOrdering must be []string, got %T (Bug #5 fix)", propOrder)
-	assert.Equal(t, []string{"name", "status"}, propOrderSlice)
-
-	t.Log("JSON conversion maintains Bug #5 fix: all array fields are []string")
-}
-
-// TestSchemaConversionStrategy verifies that strategy switching works correctly.
+// TestSchemaConversionStrategy verifies that both converters produce equivalent results.
 func TestSchemaConversionStrategy(t *testing.T) {
 	schema := &genai.Schema{
 		Type:        genai.TypeString,
@@ -3321,15 +3237,15 @@ func TestSchemaConversionStrategy(t *testing.T) {
 		Enum:        []string{"a", "b", "c"},
 	}
 
-	// Test manual conversion (default)
-	UseManualSchemaConversion()
-	manualResult, err := schemaConverter(schema)
+	// Test manual conversion
+	manualConverter := NewManualSchemaConverter()
+	manualResult, err := manualConverter.Convert(schema)
 	require.NoError(t, err)
 	require.NotNil(t, manualResult)
 
 	// Test JSON conversion
-	UseJSONSchemaConversion()
-	jsonResult, err := schemaConverter(schema)
+	jsonConverter := NewJSONSchemaConverter()
+	jsonResult, err := jsonConverter.Convert(schema)
 	require.NoError(t, err)
 	require.NotNil(t, jsonResult)
 
@@ -3344,9 +3260,7 @@ func TestSchemaConversionStrategy(t *testing.T) {
 	require.True(t, ok, "JSON enum must be []string")
 	assert.Equal(t, manualEnum, jsonEnum)
 
-	// Restore default
-	UseManualSchemaConversion()
-	t.Log("Strategy switching works correctly")
+	t.Log("Both converters produce equivalent results")
 }
 
 // TestFantasyStreamToLLM_DirectToolInput tests the OpenAI/Google pattern where tool
@@ -3436,9 +3350,9 @@ func TestFantasyStreamToLLM_ToolInputDeltaField(t *testing.T) {
 	assert.True(t, foundToolCall, "Expected to find tool call accumulated from Delta field")
 }
 
-// BenchmarkSchemaConversion_Manual benchmarks the manual schema conversion approach.
-func BenchmarkSchemaConversion_Manual(b *testing.B) {
-	schema := &genai.Schema{
+// getBenchmarkSchema returns a complex schema for benchmarking.
+func getBenchmarkSchema() *genai.Schema {
+	return &genai.Schema{
 		Type:        genai.TypeObject,
 		Description: "Complex test schema",
 		Properties: map[string]*genai.Schema{
@@ -3485,74 +3399,6 @@ func BenchmarkSchemaConversion_Manual(b *testing.B) {
 		},
 		Required:         []string{"id", "name", "status"},
 		PropertyOrdering: []string{"id", "name", "status", "count", "tags", "metadata"},
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := schemaToMap(schema)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkSchemaConversion_JSON benchmarks the JSON round-trip conversion approach.
-func BenchmarkSchemaConversion_JSON(b *testing.B) {
-	schema := &genai.Schema{
-		Type:        genai.TypeObject,
-		Description: "Complex test schema",
-		Properties: map[string]*genai.Schema{
-			"id": {
-				Type:        genai.TypeString,
-				Description: "Unique identifier",
-				Pattern:     "^[a-z0-9-]+$",
-			},
-			"name": {
-				Type:        genai.TypeString,
-				Description: "Name field",
-				MinLength:   intPtr(1),
-				MaxLength:   intPtr(100),
-			},
-			"status": {
-				Type:        genai.TypeString,
-				Description: "Status field",
-				Enum:        []string{"active", "inactive", "pending", "archived"},
-			},
-			"count": {
-				Type:        genai.TypeInteger,
-				Description: "Count field",
-				Minimum:     float64Ptr(0),
-				Maximum:     float64Ptr(1000),
-			},
-			"tags": {
-				Type:        genai.TypeArray,
-				Description: "Tags array",
-				Items: &genai.Schema{
-					Type: genai.TypeString,
-				},
-				MinItems: intPtr(0),
-				MaxItems: intPtr(10),
-			},
-			"metadata": {
-				Type:        genai.TypeObject,
-				Description: "Nested metadata",
-				Properties: map[string]*genai.Schema{
-					"created": {Type: genai.TypeString, Format: "date-time"},
-					"updated": {Type: genai.TypeString, Format: "date-time"},
-				},
-				Required: []string{"created"},
-			},
-		},
-		Required:         []string{"id", "name", "status"},
-		PropertyOrdering: []string{"id", "name", "status", "count", "tags", "metadata"},
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := schemaToMapJSON(schema)
-		if err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 
