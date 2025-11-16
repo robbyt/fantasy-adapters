@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"strings"
 
 	"charm.land/fantasy"
@@ -108,6 +109,164 @@ func (a *Adapter) GenerateContent(ctx context.Context, req *model.LLMRequest, st
 	}
 }
 
+// applyLLMConfig applies configuration parameters from ADK's GenerateContentConfig to a fantasy.Call.
+// Returns errors for unsupported configuration options.
+func applyLLMConfig(call *fantasy.Call, config *genai.GenerateContentConfig) []error {
+	if config == nil {
+		return nil
+	}
+
+	var errs []error
+
+	// Apply scalar configuration parameters
+	if config.Temperature != nil {
+		temp := float64(*config.Temperature)
+		call.Temperature = &temp
+	}
+	if config.TopP != nil {
+		topP := float64(*config.TopP)
+		call.TopP = &topP
+	}
+	if config.TopK != nil {
+		topK := int64(*config.TopK)
+		call.TopK = &topK
+	}
+	if config.MaxOutputTokens > 0 {
+		tokens := int64(config.MaxOutputTokens)
+		call.MaxOutputTokens = &tokens
+	}
+	if config.PresencePenalty != nil {
+		pp := float64(*config.PresencePenalty)
+		call.PresencePenalty = &pp
+	}
+	if config.FrequencyPenalty != nil {
+		fp := float64(*config.FrequencyPenalty)
+		call.FrequencyPenalty = &fp
+	}
+
+	// Detect unsupported features
+	if len(config.SafetySettings) > 0 {
+		errs = append(errs, errors.New("safety settings not supported"))
+	}
+	if config.ResponseMIMEType != "" {
+		errs = append(errs, errors.New("response MIME type not supported"))
+	}
+	if config.ResponseSchema != nil || config.ResponseJsonSchema != nil {
+		errs = append(errs, errors.New("response schema not supported"))
+	}
+	if config.ThinkingConfig != nil {
+		errs = append(errs, errors.New("thinking config not supported (use provider-specific options)"))
+	}
+	if config.CachedContent != "" {
+		errs = append(errs, errors.New("cached content not supported"))
+	}
+
+	return errs
+}
+
+// extractToolNames builds a map of tool names from a list of fantasy.Tool.
+// Only FunctionTool types are included in the map.
+func extractToolNames(tools []fantasy.Tool) map[string]bool {
+	names := make(map[string]bool)
+	for _, tool := range tools {
+		if ft, ok := tool.(fantasy.FunctionTool); ok {
+			names[ft.Name] = true
+		}
+	}
+	return names
+}
+
+// filterToolsByNames returns a new slice containing only the tools whose names
+// are in the allowed list. Order is preserved based on the original tools slice.
+func filterToolsByNames(tools []fantasy.Tool, allowed []string) []fantasy.Tool {
+	allowedSet := make(map[string]bool)
+	for _, name := range allowed {
+		allowedSet[name] = true
+	}
+
+	filtered := make([]fantasy.Tool, 0, len(allowed))
+	for _, tool := range tools {
+		if ft, ok := tool.(fantasy.FunctionTool); ok {
+			if allowedSet[ft.Name] {
+				filtered = append(filtered, tool)
+			}
+		}
+	}
+	return filtered
+}
+
+// getToolChoiceForMode converts ADK's tool calling mode to a fantasy.ToolChoice.
+// Special case: if exactly one function is allowed and mode is not NONE, that specific
+// function is returned as the choice.
+func getToolChoiceForMode(mode string, allowedNames []string) (*fantasy.ToolChoice, error) {
+	// Single allowed function forces that tool (unless mode is None)
+	if len(allowedNames) == 1 && mode != ToolModeNone {
+		tc := fantasy.ToolChoice(allowedNames[0])
+		return &tc, nil
+	}
+
+	switch mode {
+	case ToolModeAuto:
+		tc := fantasy.ToolChoiceAuto
+		return &tc, nil
+	case ToolModeAny:
+		tc := fantasy.ToolChoiceRequired
+		return &tc, nil
+	case ToolModeNone:
+		tc := fantasy.ToolChoiceNone
+		return &tc, nil
+	case ToolModeValidated:
+		return nil, errors.New("validated tool mode not supported")
+	case "":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported tool calling mode: %q", mode)
+	}
+}
+
+// applyTools converts ADK tools and tool configuration to fantasy.Call tools and tool choice.
+// Handles tool filtering by AllowedFunctionNames and tool choice mode selection.
+func applyTools(call *fantasy.Call, tools []*genai.Tool, toolConfig *genai.ToolConfig) []error {
+	var errs []error
+
+	if len(tools) > 0 {
+		fantasyTools, err := genaiToolsToFantasyTools(tools)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("tools: %w", err))
+		} else {
+			call.Tools = fantasyTools
+		}
+	}
+
+	if toolConfig != nil && toolConfig.FunctionCallingConfig != nil {
+		fc := toolConfig.FunctionCallingConfig
+
+		// Filter tools by AllowedFunctionNames if specified
+		if len(fc.AllowedFunctionNames) > 0 {
+			// Validate that all allowed names exist in the tools list
+			toolNames := extractToolNames(call.Tools)
+			for _, allowedName := range fc.AllowedFunctionNames {
+				if !toolNames[allowedName] {
+					errs = append(errs, fmt.Errorf("allowed function %q not found in tools list", allowedName))
+				}
+			}
+
+			// Filter tools to only include allowed ones
+			call.Tools = filterToolsByNames(call.Tools, fc.AllowedFunctionNames)
+		}
+
+		// Set ToolChoice based on Mode
+		toolChoice, err := getToolChoiceForMode(string(fc.Mode), fc.AllowedFunctionNames)
+		if err != nil {
+			errs = append(errs, err)
+		} else if toolChoice != nil {
+			call.ToolChoice = toolChoice
+		}
+	}
+
+	return errs
+}
+
 // llmRequestToFantasyCall converts an ADK LLMRequest to a fantasy.Call.
 //
 // Converts:
@@ -137,47 +296,10 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 	var errs []error
 
 	if req.Config != nil {
-		if req.Config.Temperature != nil {
-			temp := float64(*req.Config.Temperature)
-			call.Temperature = &temp
-		}
-		if req.Config.TopP != nil {
-			topP := float64(*req.Config.TopP)
-			call.TopP = &topP
-		}
-		if req.Config.TopK != nil {
-			topK := int64(*req.Config.TopK)
-			call.TopK = &topK
-		}
-		if req.Config.MaxOutputTokens > 0 {
-			tokens := int64(req.Config.MaxOutputTokens)
-			call.MaxOutputTokens = &tokens
-		}
-		if req.Config.PresencePenalty != nil {
-			pp := float64(*req.Config.PresencePenalty)
-			call.PresencePenalty = &pp
-		}
-		if req.Config.FrequencyPenalty != nil {
-			fp := float64(*req.Config.FrequencyPenalty)
-			call.FrequencyPenalty = &fp
-		}
+		// Apply configuration parameters
+		errs = append(errs, applyLLMConfig(&call, req.Config)...)
 
-		if len(req.Config.SafetySettings) > 0 {
-			errs = append(errs, errors.New("safety settings not supported"))
-		}
-		if req.Config.ResponseMIMEType != "" {
-			errs = append(errs, errors.New("response MIME type not supported"))
-		}
-		if req.Config.ResponseSchema != nil || req.Config.ResponseJsonSchema != nil {
-			errs = append(errs, errors.New("response schema not supported"))
-		}
-		if req.Config.ThinkingConfig != nil {
-			errs = append(errs, errors.New("thinking config not supported (use provider-specific options)"))
-		}
-		if req.Config.CachedContent != "" {
-			errs = append(errs, errors.New("cached content not supported"))
-		}
-
+		// Handle system instruction
 		if req.Config.SystemInstruction != nil {
 			systemMsg, err := genaiSystemInstructionToFantasyMessage(req.Config.SystemInstruction)
 			if err != nil {
@@ -187,76 +309,8 @@ func llmRequestToFantasyCall(req *model.LLMRequest) (fantasy.Call, error) {
 			}
 		}
 
-		if len(req.Config.Tools) > 0 {
-			tools, err := genaiToolsToFantasyTools(req.Config.Tools)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("tools: %w", err))
-			} else {
-				call.Tools = tools
-			}
-		}
-
-		if req.Config.ToolConfig != nil && req.Config.ToolConfig.FunctionCallingConfig != nil {
-			fc := req.Config.ToolConfig.FunctionCallingConfig
-
-			// Filter tools by AllowedFunctionNames if specified
-			if len(fc.AllowedFunctionNames) > 0 {
-				// Validate that all allowed names exist in the tools list
-				toolNames := make(map[string]bool)
-				for _, tool := range call.Tools {
-					if ft, ok := tool.(fantasy.FunctionTool); ok {
-						toolNames[ft.Name] = true
-					}
-				}
-
-				for _, allowedName := range fc.AllowedFunctionNames {
-					if !toolNames[allowedName] {
-						errs = append(errs, fmt.Errorf("allowed function %q not found in tools list", allowedName))
-					}
-				}
-
-				// Filter tools to only include allowed ones
-				filteredTools := make([]fantasy.Tool, 0, len(fc.AllowedFunctionNames))
-				for _, tool := range call.Tools {
-					if ft, ok := tool.(fantasy.FunctionTool); ok {
-						for _, allowedName := range fc.AllowedFunctionNames {
-							if ft.Name == allowedName {
-								filteredTools = append(filteredTools, tool)
-								break
-							}
-						}
-					}
-				}
-				call.Tools = filteredTools
-			}
-
-			// Set ToolChoice based on Mode
-			switch fc.Mode {
-			case ToolModeAuto:
-				tc := fantasy.ToolChoiceAuto
-				call.ToolChoice = &tc
-			case ToolModeAny:
-				tc := fantasy.ToolChoiceRequired
-				call.ToolChoice = &tc
-			case ToolModeNone:
-				tc := fantasy.ToolChoiceNone
-				call.ToolChoice = &tc
-			case ToolModeValidated:
-				errs = append(errs, errors.New("validated tool mode not supported"))
-			case "":
-				// No mode specified, allow specific function if only one
-			default:
-				if fc.Mode != "" {
-					errs = append(errs, fmt.Errorf("unsupported tool calling mode: %q", fc.Mode))
-				}
-			}
-
-			// Override with specific function if exactly one is allowed
-			if len(fc.AllowedFunctionNames) == 1 && fc.Mode != ToolModeNone {
-				tc := fantasy.ToolChoice(fc.AllowedFunctionNames[0])
-				call.ToolChoice = &tc
-			}
-		}
+		// Apply tools and tool configuration
+		errs = append(errs, applyTools(&call, req.Config.Tools, req.Config.ToolConfig)...)
 	}
 
 	for _, content := range req.Contents {
@@ -387,6 +441,7 @@ func schemaToMap(schema *genai.Schema) (map[string]any, error) {
 		return nil, nil
 	}
 
+	slog.Default().Debug("Manual schema conversion", "schema_type", schema.Type)
 	result := make(map[string]any)
 
 	if schema.Type != "" {
@@ -500,49 +555,109 @@ func schemaToMap(schema *genai.Schema) (map[string]any, error) {
 	return result, nil
 }
 
+// schemaToMapJSON converts a genai.Schema to map[string]any using JSON round-trip.
+// This is an alternative to schemaToMap that uses standard library serialization.
+// Still requires normalizeSchemaArrays to maintain Bug #5 fix for MCP compatibility.
+func schemaToMapJSON(schema *genai.Schema) (map[string]any, error) {
+	if schema == nil {
+		return nil, nil
+	}
+
+	slog.Default().Debug("JSON schema conversion", "schema_type", schema.Type)
+
+	// Marshal schema to JSON bytes
+	jsonBytes, err := json.Marshal(schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal schema: %w", err)
+	}
+
+	// Unmarshal JSON bytes to map
+	var result map[string]any
+	if err := json.Unmarshal(jsonBytes, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal schema: %w", err)
+	}
+
+	// Lowercase type field to match manual conversion behavior (per JSON Schema spec)
+	lowercaseTypeField(result)
+
+	// CRITICAL: Normalize arrays for Bug #5 fix (MCP strict JSON schema compatibility)
+	normalizeSchemaArrays(result)
+
+	return result, nil
+}
+
+// lowercaseTypeField recursively lowercases all "type" fields in the schema map.
+// This ensures consistency with the manual schemaToMap implementation and JSON Schema spec.
+func lowercaseTypeField(schema map[string]any) {
+	if typeVal, ok := schema["type"]; ok {
+		if typeStr, ok := typeVal.(string); ok {
+			schema["type"] = strings.ToLower(typeStr)
+		}
+	}
+
+	// Recursively lowercase in nested properties
+	if props, ok := schema["properties"].(map[string]any); ok {
+		for _, prop := range props {
+			if propSchema, ok := prop.(map[string]any); ok {
+				lowercaseTypeField(propSchema)
+			}
+		}
+	}
+
+	// Lowercase in array items schema
+	if items, ok := schema["items"].(map[string]any); ok {
+		lowercaseTypeField(items)
+	}
+
+	// Recursively lowercase in anyOf schemas
+	if anyOf, ok := schema["anyOf"].([]interface{}); ok {
+		for _, item := range anyOf {
+			if subSchema, ok := item.(map[string]any); ok {
+				lowercaseTypeField(subSchema)
+			}
+		}
+	}
+}
+
+// schemaConverter is the active schema conversion strategy.
+// Can be toggled using UseJSONSchemaConversion() and UseManualSchemaConversion().
+var schemaConverter = schemaToMap
+
+// UseJSONSchemaConversion switches to JSON round-trip schema conversion.
+func UseJSONSchemaConversion() {
+	schemaConverter = schemaToMapJSON
+}
+
+// UseManualSchemaConversion switches to manual schema conversion (default).
+func UseManualSchemaConversion() {
+	schemaConverter = schemaToMap
+}
+
+// normalizeStringArrayField converts a []interface{} field to []string for the given field name.
+// This is necessary for JSON Schema fields that must be string arrays (required, enum, propertyOrdering).
+func normalizeStringArrayField(schema map[string]any, fieldName string) {
+	if field, ok := schema[fieldName]; ok && field != nil {
+		if fieldSlice, ok := field.([]interface{}); ok {
+			strSlice := make([]string, 0, len(fieldSlice))
+			for _, item := range fieldSlice {
+				if str, ok := item.(string); ok {
+					strSlice = append(strSlice, str)
+				}
+			}
+			schema[fieldName] = strSlice
+		}
+	}
+}
+
 // normalizeSchemaArrays converts []interface{} to []string for schema fields
 // that must be string arrays per JSON Schema spec (required, enum, propertyOrdering).
 // Also recursively normalizes nested schemas in properties, items, and anyOf.
 // This handles type mismatches from JSON marshal/unmarshal round-trips.
 func normalizeSchemaArrays(schema map[string]any) {
-	// Normalize 'required' field
-	if req, ok := schema["required"]; ok && req != nil {
-		if reqSlice, ok := req.([]interface{}); ok {
-			strSlice := make([]string, 0, len(reqSlice))
-			for _, item := range reqSlice {
-				if str, ok := item.(string); ok {
-					strSlice = append(strSlice, str)
-				}
-			}
-			schema["required"] = strSlice
-		}
-	}
-
-	// Normalize 'enum' field
-	if enum, ok := schema["enum"]; ok && enum != nil {
-		if enumSlice, ok := enum.([]interface{}); ok {
-			strSlice := make([]string, 0, len(enumSlice))
-			for _, item := range enumSlice {
-				if str, ok := item.(string); ok {
-					strSlice = append(strSlice, str)
-				}
-			}
-			schema["enum"] = strSlice
-		}
-	}
-
-	// Normalize 'propertyOrdering' field
-	if propOrder, ok := schema["propertyOrdering"]; ok && propOrder != nil {
-		if propOrderSlice, ok := propOrder.([]interface{}); ok {
-			strSlice := make([]string, 0, len(propOrderSlice))
-			for _, item := range propOrderSlice {
-				if str, ok := item.(string); ok {
-					strSlice = append(strSlice, str)
-				}
-			}
-			schema["propertyOrdering"] = strSlice
-		}
-	}
+	// Normalize string array fields
+	normalizeStringArrayField(schema, "required")
+	normalizeStringArrayField(schema, "enum")
+	normalizeStringArrayField(schema, "propertyOrdering")
 
 	// Recursively normalize nested properties
 	if props, ok := schema["properties"].(map[string]any); ok {
@@ -572,20 +687,35 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 	var fantasyTools []fantasy.Tool
 	var errs []error
 
+	slog.Default().Debug("ADK->Fantasy tool conversion starting", "tool_count", len(tools))
+
 	for _, tool := range tools {
 		if len(tool.FunctionDeclarations) > 0 {
 			for _, fn := range tool.FunctionDeclarations {
+				slog.Default().Debug("Converting tool schema",
+					"tool_name", fn.Name,
+					"description", fn.Description,
+					"has_parameters", fn.Parameters != nil,
+					"has_json_schema", fn.ParametersJsonSchema != nil)
+
 				params := make(map[string]any)
 				if fn.Parameters != nil {
-					schemaMap, err := schemaToMap(fn.Parameters)
+					slog.Default().Debug("Using genai.Schema Parameters", "tool_name", fn.Name)
+					schemaMap, err := schemaConverter(fn.Parameters)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("failed to convert schema for function %q: %w", fn.Name, err))
 					} else if schemaMap != nil {
 						params = schemaMap
 					}
 				} else if fn.ParametersJsonSchema != nil {
+					slog.Default().Debug("Using ParametersJsonSchema",
+						"tool_name", fn.Name,
+						"schema_type", fmt.Sprintf("%T", fn.ParametersJsonSchema))
 					switch v := fn.ParametersJsonSchema.(type) {
 					case map[string]any:
+						slog.Default().Debug("ParametersJsonSchema is map",
+							"tool_name", fn.Name,
+							"raw_schema", v)
 						params = v
 					case []byte:
 						if err := json.Unmarshal(v, &params); err != nil {
@@ -602,11 +732,16 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 					// Normalize array fields to ensure []string type for strict API compatibility
 					normalizeSchemaArrays(params)
 				}
-				fantasyTools = append(fantasyTools, fantasy.FunctionTool{
+				ft := fantasy.FunctionTool{
 					Name:        fn.Name,
 					Description: fn.Description,
 					InputSchema: params,
-				})
+				}
+				slog.Default().Debug("Fantasy tool created",
+					"name", ft.Name,
+					"description", ft.Description,
+					"schema", ft.InputSchema)
+				fantasyTools = append(fantasyTools, ft)
 			}
 		}
 
@@ -634,6 +769,10 @@ func genaiToolsToFantasyTools(tools []*genai.Tool) ([]fantasy.Tool, error) {
 //   - CitationMetadata, GroundingMetadata, LogprobsResult: nil (not supported)
 //   - CustomMetadata: nil, Interrupted: false, AvgLogprobs: 0
 func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
+	slog.Default().Debug("Fantasy->ADK response conversion",
+		"content_count", len(resp.Content),
+		"finish_reason", resp.FinishReason)
+
 	llmResp := &model.LLMResponse{
 		Content: &genai.Content{
 			Role:  RoleModel,
@@ -661,17 +800,27 @@ func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
 	for _, content := range resp.Content {
 		switch c := content.(type) {
 		case fantasy.TextContent:
+			slog.Default().Debug("Converting TextContent", "text_length", len(c.Text))
 			llmResp.Content.Parts = append(llmResp.Content.Parts, &genai.Part{
 				Text: c.Text,
 			})
 		case fantasy.ToolCallContent:
+			slog.Default().Debug("Converting ToolCallContent",
+				"tool_name", c.ToolName,
+				"tool_call_id", c.ToolCallID,
+				"input_length", len(c.Input))
 			args := make(map[string]any)
 			if c.Input != "" {
 				if err := json.Unmarshal([]byte(c.Input), &args); err != nil {
+					slog.Default().Error("Failed to unmarshal tool input",
+						"tool_name", c.ToolName,
+						"input", c.Input,
+						"error", err)
 					llmResp.ErrorCode = ErrorCodeUnmarshal
 					llmResp.ErrorMessage = fmt.Sprintf("failed to unmarshal tool call input: %v", err)
 				}
 			}
+			slog.Default().Debug("Tool call args parsed", "tool_name", c.ToolName, "args", args)
 			llmResp.Content.Parts = append(llmResp.Content.Parts, &genai.Part{
 				FunctionCall: &genai.FunctionCall{
 					ID:   c.ToolCallID,
@@ -691,6 +840,300 @@ func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
 	return llmResp
 }
 
+// streamProcessor manages state during streaming response processing.
+// It accumulates content parts and yields responses at appropriate times.
+type streamProcessor struct {
+	currentContent       *genai.Content
+	currentPart          *genai.Part
+	partIndex            int
+	toolInputAccumulator map[string]*strings.Builder
+	yieldedToolIDs       map[string]bool
+}
+
+// newStreamProcessor creates a new stream processor with initialized state.
+func newStreamProcessor() *streamProcessor {
+	return &streamProcessor{
+		toolInputAccumulator: make(map[string]*strings.Builder),
+		yieldedToolIDs:       make(map[string]bool),
+	}
+}
+
+// handleError processes error stream parts.
+func (p *streamProcessor) handleError(part fantasy.StreamPart, yield func(*model.LLMResponse, error) bool) bool {
+	errMsg := ""
+	errCode := ""
+	if part.Error != nil {
+		errMsg = part.Error.Error()
+		errCode = ErrorCodeGeneric
+	}
+	slog.Default().Error("STREAM: Error received",
+		"error", errMsg,
+		"error_code", errCode)
+	return yield(&model.LLMResponse{
+		Content:           nil,
+		CitationMetadata:  nil,
+		GroundingMetadata: nil,
+		UsageMetadata:     nil,
+		CustomMetadata:    nil,
+		LogprobsResult:    nil,
+		Partial:           false,
+		TurnComplete:      true,
+		Interrupted:       false,
+		ErrorCode:         errCode,
+		ErrorMessage:      errMsg,
+		FinishReason:      genai.FinishReasonOther,
+		AvgLogprobs:       0,
+	}, part.Error)
+}
+
+// handleTextStart processes text start stream parts.
+func (p *streamProcessor) handleTextStart() {
+	slog.Default().Debug("STREAM: Text start")
+	if p.currentContent == nil {
+		p.currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
+	}
+	p.currentPart = &genai.Part{Text: ""}
+	p.currentContent.Parts = append(p.currentContent.Parts, p.currentPart)
+}
+
+// handleTextDelta processes text delta stream parts and yields partial responses.
+func (p *streamProcessor) handleTextDelta(part fantasy.StreamPart, yield func(*model.LLMResponse, error) bool) bool {
+	if p.currentPart != nil {
+		p.currentPart.Text += part.Delta
+		deltaContent := &genai.Content{
+			Role: RoleModel,
+			Parts: []*genai.Part{
+				{Text: part.Delta},
+			},
+		}
+		return yield(&model.LLMResponse{
+			Content:           deltaContent,
+			CitationMetadata:  nil,
+			GroundingMetadata: nil,
+			UsageMetadata:     nil,
+			CustomMetadata:    nil,
+			LogprobsResult:    nil,
+			Partial:           true,
+			TurnComplete:      false,
+			Interrupted:       false,
+			ErrorCode:         "",
+			ErrorMessage:      "",
+			FinishReason:      "",
+			AvgLogprobs:       0,
+		}, nil)
+	}
+	return true
+}
+
+// handleTextEnd processes text end stream parts.
+func (p *streamProcessor) handleTextEnd() {
+	p.currentPart = nil
+	p.partIndex++
+}
+
+// handleToolInputStart processes tool input start stream parts.
+func (p *streamProcessor) handleToolInputStart(part fantasy.StreamPart) {
+	slog.Default().Debug("STREAM: Tool input start",
+		"tool_name", part.ToolCallName,
+		"tool_id", part.ID)
+	if p.currentContent == nil {
+		p.currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
+	}
+	p.currentPart = &genai.Part{
+		FunctionCall: &genai.FunctionCall{
+			ID:   part.ID,
+			Name: part.ToolCallName,
+			Args: make(map[string]any),
+		},
+	}
+	p.currentContent.Parts = append(p.currentContent.Parts, p.currentPart)
+	p.toolInputAccumulator[part.ID] = &strings.Builder{}
+}
+
+// handleToolInputDelta processes tool input delta stream parts.
+func (p *streamProcessor) handleToolInputDelta(part fantasy.StreamPart) {
+	if builder, ok := p.toolInputAccumulator[part.ID]; ok {
+		// Different providers use different fields:
+		// - Anthropic uses ToolCallInput
+		// - OpenAI/Google use Delta (consistent with TextDelta, ReasoningDelta)
+		if part.Delta != "" {
+			builder.WriteString(part.Delta)
+		} else if part.ToolCallInput != "" {
+			builder.WriteString(part.ToolCallInput)
+		}
+	}
+}
+
+// handleToolInputEnd processes tool input end stream parts and yields tool call responses.
+func (p *streamProcessor) handleToolInputEnd(part fantasy.StreamPart, yield func(*model.LLMResponse, error) bool) bool {
+	builder, ok := p.toolInputAccumulator[part.ID]
+	if !ok {
+		slog.Default().Warn("STREAM: Tool input end for unknown ID", "tool_id", part.ID)
+		return true
+	}
+
+	if p.currentPart != nil && p.currentPart.FunctionCall != nil {
+		var jsonStr string
+
+		// Check if we accumulated deltas (Anthropic streaming pattern)
+		if builder.Len() > 0 {
+			jsonStr = builder.String()
+		} else if part.ToolCallInput != "" {
+			// No deltas, use direct input (OpenAI/Google pattern)
+			// OpenAI and Google send the full arguments in the ToolCall event
+			// instead of streaming them as deltas
+			jsonStr = part.ToolCallInput
+		}
+
+		slog.Default().Debug("STREAM: Tool input end",
+			"tool_name", p.currentPart.FunctionCall.Name,
+			"tool_id", part.ID,
+			"input_json", jsonStr)
+		if jsonStr != "" {
+			if err := json.Unmarshal([]byte(jsonStr), &p.currentPart.FunctionCall.Args); err != nil {
+				slog.Default().Error("STREAM: Failed to unmarshal tool input",
+					"tool_name", p.currentPart.FunctionCall.Name,
+					"input", jsonStr,
+					"error", err)
+				return yield(&model.LLMResponse{
+					Content:           nil,
+					CitationMetadata:  nil,
+					GroundingMetadata: nil,
+					UsageMetadata:     nil,
+					CustomMetadata:    nil,
+					LogprobsResult:    nil,
+					Partial:           false,
+					TurnComplete:      true,
+					Interrupted:       false,
+					ErrorCode:         "UNMARSHAL_ERROR",
+					ErrorMessage:      fmt.Sprintf("failed to unmarshal tool input: %v", err),
+					FinishReason:      genai.FinishReasonOther,
+					AvgLogprobs:       0,
+				}, err)
+			}
+		}
+	}
+
+	toolCallContent := &genai.Content{
+		Role:  RoleModel,
+		Parts: []*genai.Part{p.currentPart},
+	}
+	if !yield(&model.LLMResponse{
+		Content:           toolCallContent,
+		CitationMetadata:  nil,
+		GroundingMetadata: nil,
+		UsageMetadata:     nil,
+		CustomMetadata:    nil,
+		LogprobsResult:    nil,
+		Partial:           false,
+		TurnComplete:      false,
+		Interrupted:       false,
+		ErrorCode:         "",
+		ErrorMessage:      "",
+		FinishReason:      "",
+		AvgLogprobs:       0,
+	}, nil) {
+		return false
+	}
+
+	p.yieldedToolIDs[part.ID] = true
+	delete(p.toolInputAccumulator, part.ID)
+	p.currentPart = nil
+	p.partIndex++
+	return true
+}
+
+// handleReasoningStart processes reasoning start stream parts.
+func (p *streamProcessor) handleReasoningStart() {
+	slog.Default().Debug("STREAM: Reasoning start")
+	if p.currentContent == nil {
+		p.currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
+	}
+	p.currentPart = &genai.Part{Text: "", Thought: true}
+	p.currentContent.Parts = append(p.currentContent.Parts, p.currentPart)
+}
+
+// handleReasoningDelta processes reasoning delta stream parts and yields partial responses.
+func (p *streamProcessor) handleReasoningDelta(part fantasy.StreamPart, yield func(*model.LLMResponse, error) bool) bool {
+	if p.currentPart != nil {
+		p.currentPart.Text += part.Delta
+		deltaContent := &genai.Content{
+			Role: RoleModel,
+			Parts: []*genai.Part{
+				{Text: part.Delta, Thought: true},
+			},
+		}
+		return yield(&model.LLMResponse{
+			Content:           deltaContent,
+			CitationMetadata:  nil,
+			GroundingMetadata: nil,
+			UsageMetadata:     nil,
+			CustomMetadata:    nil,
+			LogprobsResult:    nil,
+			Partial:           true,
+			TurnComplete:      false,
+			Interrupted:       false,
+			ErrorCode:         "",
+			ErrorMessage:      "",
+			FinishReason:      "",
+			AvgLogprobs:       0,
+		}, nil)
+	}
+	return true
+}
+
+// handleReasoningEnd processes reasoning end stream parts.
+func (p *streamProcessor) handleReasoningEnd() {
+	p.currentPart = nil
+	p.partIndex++
+}
+
+// handleFinish processes finish stream parts and yields the final response.
+func (p *streamProcessor) handleFinish(part fantasy.StreamPart, yield func(*model.LLMResponse, error) bool) bool {
+	slog.Default().Debug("STREAM: Finish received",
+		"finish_reason", part.FinishReason,
+		"input_tokens", part.Usage.InputTokens,
+		"output_tokens", part.Usage.OutputTokens)
+	finalContent := p.currentContent
+	if p.currentContent != nil && len(p.yieldedToolIDs) > 0 {
+		filteredParts := make([]*genai.Part, 0)
+		for _, part := range p.currentContent.Parts {
+			if part.FunctionCall != nil {
+				if p.yieldedToolIDs[part.FunctionCall.ID] {
+					continue
+				}
+			}
+			filteredParts = append(filteredParts, part)
+		}
+		if len(filteredParts) > 0 {
+			finalContent = &genai.Content{Role: RoleModel, Parts: filteredParts}
+		} else {
+			finalContent = nil
+		}
+	}
+
+	return yield(&model.LLMResponse{
+		Content:           finalContent,
+		CitationMetadata:  nil,
+		GroundingMetadata: nil,
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+			PromptTokenCount:        int32(part.Usage.InputTokens),
+			CandidatesTokenCount:    int32(part.Usage.OutputTokens),
+			TotalTokenCount:         int32(part.Usage.TotalTokens),
+			CachedContentTokenCount: int32(part.Usage.CacheReadTokens),
+		},
+		CustomMetadata: nil,
+		LogprobsResult: nil,
+		Partial:        false,
+		TurnComplete:   true,
+		Interrupted:    false,
+		ErrorCode:      "",
+		ErrorMessage:   "",
+		FinishReason:   fantasyFinishReasonToGenai(part.FinishReason),
+		AvgLogprobs:    0,
+	}, nil)
+}
+
 // fantasyStreamToLLM converts fantasy.StreamResponse to an ADK response iterator.
 //
 // Accumulates streaming parts into genai.Content and yields LLMResponse on deltas and completion:
@@ -701,231 +1144,41 @@ func fantasyResponseToLLM(resp *fantasy.Response) *model.LLMResponse {
 //   - Error: yields response with ErrorCode and ErrorMessage
 func fantasyStreamToLLM(stream fantasy.StreamResponse) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		var currentContent *genai.Content
-		var currentPart *genai.Part
-		var partIndex int
-		toolInputAccumulator := make(map[string]*strings.Builder)
-		yieldedToolIDs := make(map[string]bool)
+		slog.Default().Debug("STREAM: Starting to process fantasy stream")
+		processor := newStreamProcessor()
 
 		for part := range stream {
 			switch part.Type {
 			case fantasy.StreamPartTypeError:
-				errMsg := ""
-				errCode := ""
-				if part.Error != nil {
-					errMsg = part.Error.Error()
-					errCode = ErrorCodeGeneric
-				}
-				if !yield(&model.LLMResponse{
-					Content:           nil,
-					CitationMetadata:  nil,
-					GroundingMetadata: nil,
-					UsageMetadata:     nil,
-					CustomMetadata:    nil,
-					LogprobsResult:    nil,
-					Partial:           false,
-					TurnComplete:      true,
-					Interrupted:       false,
-					ErrorCode:         errCode,
-					ErrorMessage:      errMsg,
-					FinishReason:      genai.FinishReasonOther,
-					AvgLogprobs:       0,
-				}, part.Error) {
+				if !processor.handleError(part, yield) {
 					return
 				}
-
 			case fantasy.StreamPartTypeTextStart:
-				if currentContent == nil {
-					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
-				}
-				currentPart = &genai.Part{Text: ""}
-				currentContent.Parts = append(currentContent.Parts, currentPart)
-
+				processor.handleTextStart()
 			case fantasy.StreamPartTypeTextDelta:
-				if currentPart != nil {
-					currentPart.Text += part.Delta
-					deltaContent := &genai.Content{
-						Role: RoleModel,
-						Parts: []*genai.Part{
-							{Text: part.Delta},
-						},
-					}
-					if !yield(&model.LLMResponse{
-						Content:           deltaContent,
-						CitationMetadata:  nil,
-						GroundingMetadata: nil,
-						UsageMetadata:     nil,
-						CustomMetadata:    nil,
-						LogprobsResult:    nil,
-						Partial:           true,
-						TurnComplete:      false,
-						Interrupted:       false,
-						ErrorCode:         "",
-						ErrorMessage:      "",
-						FinishReason:      "",
-						AvgLogprobs:       0,
-					}, nil) {
-						return
-					}
+				if !processor.handleTextDelta(part, yield) {
+					return
 				}
-
 			case fantasy.StreamPartTypeTextEnd:
-				currentPart = nil
-				partIndex++
-
+				processor.handleTextEnd()
 			case fantasy.StreamPartTypeToolInputStart:
-				if currentContent == nil {
-					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
-				}
-				currentPart = &genai.Part{
-					FunctionCall: &genai.FunctionCall{
-						ID:   part.ID,
-						Name: part.ToolCallName,
-						Args: make(map[string]any),
-					},
-				}
-				currentContent.Parts = append(currentContent.Parts, currentPart)
-				toolInputAccumulator[part.ID] = &strings.Builder{}
-
+				processor.handleToolInputStart(part)
 			case fantasy.StreamPartTypeToolInputDelta:
-				if builder, ok := toolInputAccumulator[part.ID]; ok {
-					builder.WriteString(part.ToolCallInput)
-				}
-
+				processor.handleToolInputDelta(part)
 			case fantasy.StreamPartTypeToolInputEnd, fantasy.StreamPartTypeToolCall:
-				if builder, ok := toolInputAccumulator[part.ID]; ok {
-					if currentPart != nil && currentPart.FunctionCall != nil {
-						jsonStr := builder.String()
-						if jsonStr != "" {
-							if err := json.Unmarshal([]byte(jsonStr), &currentPart.FunctionCall.Args); err != nil {
-								if !yield(&model.LLMResponse{
-									Content:           nil,
-									CitationMetadata:  nil,
-									GroundingMetadata: nil,
-									UsageMetadata:     nil,
-									CustomMetadata:    nil,
-									LogprobsResult:    nil,
-									Partial:           false,
-									TurnComplete:      true,
-									Interrupted:       false,
-									ErrorCode:         "UNMARSHAL_ERROR",
-									ErrorMessage:      fmt.Sprintf("failed to unmarshal tool input: %v", err),
-									FinishReason:      genai.FinishReasonOther,
-									AvgLogprobs:       0,
-								}, err) {
-									return
-								}
-							}
-						}
-					}
-
-					toolCallContent := &genai.Content{
-						Role:  RoleModel,
-						Parts: []*genai.Part{currentPart},
-					}
-					if !yield(&model.LLMResponse{
-						Content:           toolCallContent,
-						CitationMetadata:  nil,
-						GroundingMetadata: nil,
-						UsageMetadata:     nil,
-						CustomMetadata:    nil,
-						LogprobsResult:    nil,
-						Partial:           false,
-						TurnComplete:      false,
-						Interrupted:       false,
-						ErrorCode:         "",
-						ErrorMessage:      "",
-						FinishReason:      "",
-						AvgLogprobs:       0,
-					}, nil) {
-						return
-					}
-
-					yieldedToolIDs[part.ID] = true
-
-					delete(toolInputAccumulator, part.ID)
+				if !processor.handleToolInputEnd(part, yield) {
+					return
 				}
-				currentPart = nil
-				partIndex++
-
 			case fantasy.StreamPartTypeReasoningStart:
-				if currentContent == nil {
-					currentContent = &genai.Content{Role: RoleModel, Parts: []*genai.Part{}}
-				}
-				currentPart = &genai.Part{Text: "", Thought: true}
-				currentContent.Parts = append(currentContent.Parts, currentPart)
-
+				processor.handleReasoningStart()
 			case fantasy.StreamPartTypeReasoningDelta:
-				if currentPart != nil {
-					currentPart.Text += part.Delta
-					deltaContent := &genai.Content{
-						Role: RoleModel,
-						Parts: []*genai.Part{
-							{Text: part.Delta, Thought: true},
-						},
-					}
-					if !yield(&model.LLMResponse{
-						Content:           deltaContent,
-						CitationMetadata:  nil,
-						GroundingMetadata: nil,
-						UsageMetadata:     nil,
-						CustomMetadata:    nil,
-						LogprobsResult:    nil,
-						Partial:           true,
-						TurnComplete:      false,
-						Interrupted:       false,
-						ErrorCode:         "",
-						ErrorMessage:      "",
-						FinishReason:      "",
-						AvgLogprobs:       0,
-					}, nil) {
-						return
-					}
+				if !processor.handleReasoningDelta(part, yield) {
+					return
 				}
-
 			case fantasy.StreamPartTypeReasoningEnd:
-				currentPart = nil
-				partIndex++
-
+				processor.handleReasoningEnd()
 			case fantasy.StreamPartTypeFinish:
-				finalContent := currentContent
-				if currentContent != nil && len(yieldedToolIDs) > 0 {
-					filteredParts := make([]*genai.Part, 0)
-					for _, part := range currentContent.Parts {
-						if part.FunctionCall != nil {
-							if yieldedToolIDs[part.FunctionCall.ID] {
-								continue
-							}
-						}
-						filteredParts = append(filteredParts, part)
-					}
-					if len(filteredParts) > 0 {
-						finalContent = &genai.Content{Role: RoleModel, Parts: filteredParts}
-					} else {
-						finalContent = nil
-					}
-				}
-
-				if !yield(&model.LLMResponse{
-					Content:           finalContent,
-					CitationMetadata:  nil,
-					GroundingMetadata: nil,
-					UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
-						PromptTokenCount:        int32(part.Usage.InputTokens),
-						CandidatesTokenCount:    int32(part.Usage.OutputTokens),
-						TotalTokenCount:         int32(part.Usage.TotalTokens),
-						CachedContentTokenCount: int32(part.Usage.CacheReadTokens),
-					},
-					CustomMetadata: nil,
-					LogprobsResult: nil,
-					Partial:        false,
-					TurnComplete:   true,
-					Interrupted:    false,
-					ErrorCode:      "",
-					ErrorMessage:   "",
-					FinishReason:   fantasyFinishReasonToGenai(part.FinishReason),
-					AvgLogprobs:    0,
-				}, nil) {
+				if !processor.handleFinish(part, yield) {
 					return
 				}
 			}

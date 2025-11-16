@@ -52,6 +52,22 @@ func (m *MockLanguageModel) Stream(ctx context.Context, call fantasy.Call) (fant
 	return args.Get(0).(fantasy.StreamResponse), args.Error(1)
 }
 
+func (m *MockLanguageModel) GenerateObject(ctx context.Context, call fantasy.ObjectCall) (*fantasy.ObjectResponse, error) {
+	args := m.Called(ctx, call)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*fantasy.ObjectResponse), args.Error(1)
+}
+
+func (m *MockLanguageModel) StreamObject(ctx context.Context, call fantasy.ObjectCall) (fantasy.ObjectStreamResponse, error) {
+	args := m.Called(ctx, call)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(fantasy.ObjectStreamResponse), args.Error(1)
+}
+
 // Test helper functions
 
 type streamBuilder struct {
@@ -105,10 +121,29 @@ func (sb *streamBuilder) addToolDelta(id, input string) *streamBuilder {
 	return sb
 }
 
+func (sb *streamBuilder) addToolDeltaWithDelta(id, delta string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:  fantasy.StreamPartTypeToolInputDelta,
+		ID:    id,
+		Delta: delta,
+	})
+	return sb
+}
+
 func (sb *streamBuilder) addToolEnd(id string) *streamBuilder {
 	sb.parts = append(sb.parts, fantasy.StreamPart{
 		Type: fantasy.StreamPartTypeToolInputEnd,
 		ID:   id,
+	})
+	return sb
+}
+
+func (sb *streamBuilder) addToolCall(id, name, input string) *streamBuilder {
+	sb.parts = append(sb.parts, fantasy.StreamPart{
+		Type:          fantasy.StreamPartTypeToolCall,
+		ID:            id,
+		ToolCallName:  name,
+		ToolCallInput: input,
 	})
 	return sb
 }
@@ -3223,3 +3258,304 @@ func TestFantasyStreamToLLM_ToolCallRequiredFields(t *testing.T) {
 	t.Logf("  Args type: %T ✓", toolCall.Args)
 	t.Logf("  Args content: %+v ✓", toolCall.Args)
 }
+
+// TestSchemaToMapJSON_Bug5Compatibility verifies that JSON conversion maintains Bug #5 fix.
+// Bug #5: Array fields (required, enum, propertyOrdering) must be []string for MCP compatibility.
+func TestSchemaToMapJSON_Bug5Compatibility(t *testing.T) {
+	schema := &genai.Schema{
+		Type:        genai.TypeObject,
+		Description: "Test schema",
+		Properties: map[string]*genai.Schema{
+			"name": {
+				Type:        genai.TypeString,
+				Description: "Name field",
+			},
+			"status": {
+				Type:        genai.TypeString,
+				Description: "Status field",
+				Enum:        []string{"active", "inactive", "pending"},
+			},
+		},
+		Required:         []string{"name", "status"},
+		PropertyOrdering: []string{"name", "status"},
+	}
+
+	// Test JSON conversion
+	result, err := schemaToMapJSON(schema)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Verify required field is []string (not []interface{})
+	required, ok := result["required"]
+	require.True(t, ok, "required field must exist")
+	requiredSlice, ok := required.([]string)
+	require.True(t, ok, "required must be []string, got %T (Bug #5 fix)", required)
+	assert.Equal(t, []string{"name", "status"}, requiredSlice)
+
+	// Verify enum in nested property is []string
+	props, ok := result["properties"].(map[string]any)
+	require.True(t, ok, "properties must be map")
+	statusProp, ok := props["status"].(map[string]any)
+	require.True(t, ok, "status property must be map")
+	enum, ok := statusProp["enum"]
+	require.True(t, ok, "enum field must exist")
+	enumSlice, ok := enum.([]string)
+	require.True(t, ok, "enum must be []string, got %T (Bug #5 fix)", enum)
+	assert.Equal(t, []string{"active", "inactive", "pending"}, enumSlice)
+
+	// Verify propertyOrdering is []string
+	propOrder, ok := result["propertyOrdering"]
+	require.True(t, ok, "propertyOrdering field must exist")
+	propOrderSlice, ok := propOrder.([]string)
+	require.True(t, ok, "propertyOrdering must be []string, got %T (Bug #5 fix)", propOrder)
+	assert.Equal(t, []string{"name", "status"}, propOrderSlice)
+
+	t.Log("JSON conversion maintains Bug #5 fix: all array fields are []string")
+}
+
+// TestSchemaConversionStrategy verifies that strategy switching works correctly.
+func TestSchemaConversionStrategy(t *testing.T) {
+	schema := &genai.Schema{
+		Type:        genai.TypeString,
+		Description: "Test field",
+		Enum:        []string{"a", "b", "c"},
+	}
+
+	// Test manual conversion (default)
+	UseManualSchemaConversion()
+	manualResult, err := schemaConverter(schema)
+	require.NoError(t, err)
+	require.NotNil(t, manualResult)
+
+	// Test JSON conversion
+	UseJSONSchemaConversion()
+	jsonResult, err := schemaConverter(schema)
+	require.NoError(t, err)
+	require.NotNil(t, jsonResult)
+
+	// Both should produce equivalent results
+	assert.Equal(t, manualResult["type"], jsonResult["type"])
+	assert.Equal(t, manualResult["description"], jsonResult["description"])
+
+	// Both should have []string enum (Bug #5 fix)
+	manualEnum, ok := manualResult["enum"].([]string)
+	require.True(t, ok, "manual enum must be []string")
+	jsonEnum, ok := jsonResult["enum"].([]string)
+	require.True(t, ok, "JSON enum must be []string")
+	assert.Equal(t, manualEnum, jsonEnum)
+
+	// Restore default
+	UseManualSchemaConversion()
+	t.Log("Strategy switching works correctly")
+}
+
+// TestFantasyStreamToLLM_DirectToolInput tests the OpenAI/Google pattern where tool
+// arguments arrive directly in the ToolCall event instead of being accumulated from deltas.
+func TestFantasyStreamToLLM_DirectToolInput(t *testing.T) {
+	stream := newStreamBuilder().
+		addTextStart("text-1").
+		addTextDelta("text-1", "Calling geocode tool.").
+		addTextEnd("text-1").
+		addToolStart("call-direct", "geocode_city").
+		addToolCall("call-direct", "geocode_city", `{"city_name": "San Francisco"}`).
+		addToolEnd("call-direct").
+		addFinish(fantasy.FinishReasonToolCalls, fantasy.Usage{
+			InputTokens:  50,
+			OutputTokens: 20,
+			TotalTokens:  70,
+		}).
+		build()
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundToolCall bool
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil && part.FunctionCall.Name == "geocode_city" {
+					foundToolCall = true
+					assert.Equal(t, "call-direct", part.FunctionCall.ID)
+					assert.Equal(t, "geocode_city", part.FunctionCall.Name)
+					require.NotNil(t, part.FunctionCall.Args)
+					cityName, ok := part.FunctionCall.Args["city_name"]
+					require.True(t, ok, "Should have city_name argument")
+					assert.Equal(t, "San Francisco", cityName)
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundToolCall, "Expected to find tool call with direct input")
+}
+
+// TestFantasyStreamToLLM_ToolInputDeltaField tests the OpenAI/Google pattern where tool
+// input deltas use the Delta field instead of ToolCallInput field.
+func TestFantasyStreamToLLM_ToolInputDeltaField(t *testing.T) {
+	stream := newStreamBuilder().
+		addTextStart("text-1").
+		addTextDelta("text-1", "Calling weather tool.").
+		addTextEnd("text-1").
+		addToolStart("call-weather", "get_weather").
+		addToolDeltaWithDelta("call-weather", `{"latitude":`).
+		addToolDeltaWithDelta("call-weather", `40.7128,`).
+		addToolDeltaWithDelta("call-weather", `"longitude":-74.0060}`).
+		addToolEnd("call-weather").
+		addFinish(fantasy.FinishReasonToolCalls, fantasy.Usage{
+			InputTokens:  100,
+			OutputTokens: 30,
+			TotalTokens:  130,
+		}).
+		build()
+
+	iter := fantasyStreamToLLM(stream)
+
+	var foundToolCall bool
+	for resp, err := range iter {
+		require.NoError(t, err)
+		if resp.Content != nil && len(resp.Content.Parts) > 0 {
+			for _, part := range resp.Content.Parts {
+				if part.FunctionCall != nil && part.FunctionCall.Name == "get_weather" {
+					foundToolCall = true
+					assert.Equal(t, "call-weather", part.FunctionCall.ID)
+					assert.Equal(t, "get_weather", part.FunctionCall.Name)
+					require.NotNil(t, part.FunctionCall.Args)
+
+					lat, ok := part.FunctionCall.Args["latitude"]
+					require.True(t, ok, "Should have latitude argument")
+					assert.InDelta(t, 40.7128, lat, 0.0001)
+
+					lon, ok := part.FunctionCall.Args["longitude"]
+					require.True(t, ok, "Should have longitude argument")
+					assert.InDelta(t, -74.0060, lon, 0.0001)
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundToolCall, "Expected to find tool call accumulated from Delta field")
+}
+
+// BenchmarkSchemaConversion_Manual benchmarks the manual schema conversion approach.
+func BenchmarkSchemaConversion_Manual(b *testing.B) {
+	schema := &genai.Schema{
+		Type:        genai.TypeObject,
+		Description: "Complex test schema",
+		Properties: map[string]*genai.Schema{
+			"id": {
+				Type:        genai.TypeString,
+				Description: "Unique identifier",
+				Pattern:     "^[a-z0-9-]+$",
+			},
+			"name": {
+				Type:        genai.TypeString,
+				Description: "Name field",
+				MinLength:   intPtr(1),
+				MaxLength:   intPtr(100),
+			},
+			"status": {
+				Type:        genai.TypeString,
+				Description: "Status field",
+				Enum:        []string{"active", "inactive", "pending", "archived"},
+			},
+			"count": {
+				Type:        genai.TypeInteger,
+				Description: "Count field",
+				Minimum:     float64Ptr(0),
+				Maximum:     float64Ptr(1000),
+			},
+			"tags": {
+				Type:        genai.TypeArray,
+				Description: "Tags array",
+				Items: &genai.Schema{
+					Type: genai.TypeString,
+				},
+				MinItems: intPtr(0),
+				MaxItems: intPtr(10),
+			},
+			"metadata": {
+				Type:        genai.TypeObject,
+				Description: "Nested metadata",
+				Properties: map[string]*genai.Schema{
+					"created": {Type: genai.TypeString, Format: "date-time"},
+					"updated": {Type: genai.TypeString, Format: "date-time"},
+				},
+				Required: []string{"created"},
+			},
+		},
+		Required:         []string{"id", "name", "status"},
+		PropertyOrdering: []string{"id", "name", "status", "count", "tags", "metadata"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := schemaToMap(schema)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSchemaConversion_JSON benchmarks the JSON round-trip conversion approach.
+func BenchmarkSchemaConversion_JSON(b *testing.B) {
+	schema := &genai.Schema{
+		Type:        genai.TypeObject,
+		Description: "Complex test schema",
+		Properties: map[string]*genai.Schema{
+			"id": {
+				Type:        genai.TypeString,
+				Description: "Unique identifier",
+				Pattern:     "^[a-z0-9-]+$",
+			},
+			"name": {
+				Type:        genai.TypeString,
+				Description: "Name field",
+				MinLength:   intPtr(1),
+				MaxLength:   intPtr(100),
+			},
+			"status": {
+				Type:        genai.TypeString,
+				Description: "Status field",
+				Enum:        []string{"active", "inactive", "pending", "archived"},
+			},
+			"count": {
+				Type:        genai.TypeInteger,
+				Description: "Count field",
+				Minimum:     float64Ptr(0),
+				Maximum:     float64Ptr(1000),
+			},
+			"tags": {
+				Type:        genai.TypeArray,
+				Description: "Tags array",
+				Items: &genai.Schema{
+					Type: genai.TypeString,
+				},
+				MinItems: intPtr(0),
+				MaxItems: intPtr(10),
+			},
+			"metadata": {
+				Type:        genai.TypeObject,
+				Description: "Nested metadata",
+				Properties: map[string]*genai.Schema{
+					"created": {Type: genai.TypeString, Format: "date-time"},
+					"updated": {Type: genai.TypeString, Format: "date-time"},
+				},
+				Required: []string{"created"},
+			},
+		},
+		Required:         []string{"id", "name", "status"},
+		PropertyOrdering: []string{"id", "name", "status", "count", "tags", "metadata"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := schemaToMapJSON(schema)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Helper functions for benchmark schema construction
+func intPtr(i int64) *int64         { return &i }
+func float64Ptr(f float64) *float64 { return &f }
