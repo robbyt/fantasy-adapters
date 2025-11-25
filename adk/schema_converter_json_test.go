@@ -58,8 +58,6 @@ func TestJSONSchemaConverter_Bug5Compatibility(t *testing.T) {
 	propOrderSlice, ok := propOrder.([]string)
 	require.True(t, ok, "propertyOrdering must be []string, got %T (Bug #5 fix)", propOrder)
 	assert.Equal(t, []string{"name", "status"}, propOrderSlice)
-
-	t.Log("JSON conversion maintains Bug #5 fix: all array fields are []string")
 }
 
 func BenchmarkJSONSchemaConverter(b *testing.B) {

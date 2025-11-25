@@ -2954,11 +2954,6 @@ func TestFantasyStreamToLLM_CompleteToolCallFlow(t *testing.T) {
 	assert.Equal(t, int32(40), finalResponse.UsageMetadata.TotalTokenCount)
 
 	assert.Equal(t, genai.FinishReasonStop, finalResponse.FinishReason)
-
-	t.Logf("Complete conversation flow test passed:")
-	t.Logf("  - Text responses: %d", len(textResponses))
-	t.Logf("  - Tool calls: %d", len(toolCalls))
-	t.Logf("  - Final response present: %v", finalResponse != nil)
 }
 
 func TestFantasyStreamToLLM_ToolCallTimingDiagnostic(t *testing.T) {
@@ -3221,12 +3216,6 @@ func TestFantasyStreamToLLM_ToolCallRequiredFields(t *testing.T) {
 	assert.Contains(t, toolCall.Args, "field2", "Args must contain field2")
 	assert.Equal(t, "val1", toolCall.Args["field1"])
 	assert.InDelta(t, 42.0, toolCall.Args["field2"], 0.001)
-
-	t.Logf("Tool call structure verification:")
-	t.Logf("  ID: %s ✓", toolCall.ID)
-	t.Logf("  Name: %s ✓", toolCall.Name)
-	t.Logf("  Args type: %T ✓", toolCall.Args)
-	t.Logf("  Args content: %+v ✓", toolCall.Args)
 }
 
 // TestSchemaConversionStrategy verifies that both converters produce equivalent results.
@@ -3259,8 +3248,6 @@ func TestSchemaConversionStrategy(t *testing.T) {
 	jsonEnum, ok := jsonResult["enum"].([]string)
 	require.True(t, ok, "JSON enum must be []string")
 	assert.Equal(t, manualEnum, jsonEnum)
-
-	t.Log("Both converters produce equivalent results")
 }
 
 // TestFantasyStreamToLLM_DirectToolInput tests the OpenAI/Google pattern where tool
